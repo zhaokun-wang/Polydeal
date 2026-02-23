@@ -1,0 +1,39 @@
+JobId fedora Sun Feb 22 17:51:16 2026
+DEAL::Testing p-convergence
+DEAL::Fe degree: 1
+DEAL::Size of tria: 1024
+DEAL::N subdomains = 364
+DEAL::DoFs per cell: 3
+DEAL::Error (L2): 0.0306331
+DEAL::Error (H1): 0.257036
+DEAL::Fe degree: 2
+DEAL::Size of tria: 1024
+DEAL::N subdomains = 364
+DEAL::DoFs per cell: 6
+DEAL::Error (L2): 0.000187256
+DEAL::Error (H1): 0.0128259
+DEAL::Fe degree: 3
+DEAL::Size of tria: 1024
+DEAL::N subdomains = 364
+DEAL::DoFs per cell: 10
+DEAL::Error (L2): 4.59834e-06
+DEAL::Error (H1): 0.000439873
+DEAL::Fe degree: 4
+DEAL::Size of tria: 1024
+DEAL::N subdomains = 364
+DEAL::DoFs per cell: 15
+DEAL::Error (L2): 9.66758e-08
+DEAL::Error (H1): 1.19301e-05
+DEAL::N DoFs:                 1092
+DEAL::N DoFs:                 2184
+DEAL::N DoFs:                 3640
+DEAL::N DoFs:                 5460
+DEAL::L2 error:               3.063306e-02
+DEAL::L2 error:               1.872558e-04
+DEAL::L2 error:               4.598336e-06
+DEAL::L2 error:               9.667580e-08
+DEAL::H1 error:               2.570363e-01
+DEAL::H1 error:               1.282589e-02
+DEAL::H1 error:               4.398731e-04
+DEAL::H1 error:               1.193006e-05
+DEAL::
