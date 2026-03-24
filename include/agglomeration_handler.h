@@ -71,10 +71,12 @@ namespace dealii
      */
     template <int, int>
     class AgglomerationHandlerImplementation;
+
+    template <int, int>
+    class AgglomerationValuesBaseImplementation;
+
   } // namespace internal
 } // namespace dealii
-
-
 
 /**
  * Helper class for the storage of connectivity information of the polytopal
@@ -177,6 +179,7 @@ public:
   using AgglomerationContainer =
     typename AgglomerationIterator<dim, spacedim>::AgglomerationContainer;
 
+  template <int, int> friend class FEAggloValues;
 
   enum CellAgglomerationType
   {
@@ -905,6 +908,7 @@ private:
     master_cells_container;
 
   friend class internal::AgglomerationHandlerImplementation<dim, spacedim>;
+  friend class internal::AgglomerationValuesBaseImplementation<dim, spacedim>;
 
   internal::PolytopeCache<dim, spacedim> polytope_cache;
 
