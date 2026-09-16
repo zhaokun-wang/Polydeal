@@ -14,6 +14,9 @@
 
 #include <deal.II/lac/sparsity_tools.h>
 
+#include <algorithm>
+#include <numeric>
+
 #include <agglomeration_handler.h>
 #include <fe_agglodgp.h>
 
@@ -233,6 +236,12 @@ AgglomerationHandler<dim, spacedim>::initialize_fe_values(
     agglomeration_face_quad,
     update_quadrature_points | update_JxW_values |
       update_normal_vectors); // only for quadrature
+
+  no_subface_values = std::make_unique<FESubfaceValues<dim>>(
+    *mapping,
+    dummy_fe,
+    agglomeration_face_quad,
+    update_quadrature_points | update_JxW_values | update_normal_vectors); // only for quadrature
 }
 
 template <int dim, int spacedim>
@@ -262,6 +271,11 @@ AgglomerationHandler<dim, spacedim>::initialize_fe_values(
     agglomeration_face_quad_collection,
     update_quadrature_points | update_JxW_values |
       update_normal_vectors); // only for quadrature
+  hp_no_subface_values = std::make_unique<hp::FESubfaceValues<dim>>(
+    mapping_collection,
+    dummy_fe_collection,
+    agglomeration_face_quad_collection,
+    update_quadrature_points | update_JxW_values | update_normal_vectors); // only for quadrature
 }
 
 
@@ -1051,32 +1065,76 @@ AgglomerationHandler<dim, spacedim>::setup_ghost_polytopes()
               {
                 if (!cell->at_boundary(f))
                   {
-                    const auto &neighbor = cell->neighbor(f);
-                    if (neighbor->is_ghost())
+                    const auto &neighbor_parent = cell->neighbor(f);
+                    // if (neighbor->is_ghost())
+                    //   {
+                    //     // key of the map: the rank to which send the data
+                    //     const types::subdomain_id neigh_rank =
+                    //       neighbor->subdomain_id();
+
+                    //     // inform the "standard" neighbor about the neighboring
+                    //     // id and its master cell
+                    //     local_cell_ids_neigh_cell[neigh_rank].emplace(
+                    //       cell->id(), master_cell_id);
+
+                    //     // inform the neighboring rank that this master cell
+                    //     // (hence polytope) has the following DoF indices
+                    //     local_ghost_dofs[neigh_rank].emplace(
+                    //       master_cell_id, global_dof_indices);
+
+                    //     // ...same for bounding boxes
+                    //     const auto &bbox = bboxes[polytope->index()];
+                    //     local_ghosted_bbox[neigh_rank].emplace(master_cell_id,
+                    //                                            bbox);
+                    //   }
+                    std::vector<typename Triangulation<dim, spacedim>::active_cell_iterator>
+                      active_neighbors;
+                    if (neighbor_parent->level() < cell->level())
                       {
-                        // key of the map: the rank to which send the data
-                        const types::subdomain_id neigh_rank =
-                          neighbor->subdomain_id();
+                        // Neighbor is coarser, and is itself already active
+                        active_neighbors.push_back(neighbor_parent);
+                      }
+                    else if (neighbor_parent->is_active())
+                      {
+                        active_neighbors.push_back(neighbor_parent);
+                      }
+                    else
+                      {
+                        // Neighbor is finer: drill down to its active children
+                        for (unsigned int subface = 0;
+                             subface < cell->face(f)->n_children();
+                             ++subface)
+                          {
+                            auto child_neigh =
+                              cell->neighbor_child_on_subface(f, subface);
+                            if (child_neigh.state() == IteratorState::valid)
+                              active_neighbors.push_back(child_neigh);
+                          }
+                      }
 
-                        // inform the "standard" neighbor about the neighboring
-                        // id and its master cell
-                        local_cell_ids_neigh_cell[neigh_rank].emplace(
-                          cell->id(), master_cell_id);
+                    for (const auto &neighbor : active_neighbors)
+                      {
+                        if (neighbor->is_ghost())
+                          {
+                            const types::subdomain_id neigh_rank =
+                              neighbor->subdomain_id();
 
-                        // inform the neighboring rank that this master cell
-                        // (hence polytope) has the following DoF indices
-                        local_ghost_dofs[neigh_rank].emplace(
-                          master_cell_id, global_dof_indices);
+                            local_cell_ids_neigh_cell[neigh_rank].emplace(
+                              cell->id(), master_cell_id);
 
-                        // ...same for bounding boxes
-                        const auto &bbox = bboxes[polytope->index()];
-                        local_ghosted_bbox[neigh_rank].emplace(master_cell_id,
-                                                               bbox);
+                            local_ghost_dofs[neigh_rank].emplace(
+                              master_cell_id, global_dof_indices);
+
+                            const auto &bbox = bboxes[polytope->index()];
+                            local_ghosted_bbox[neigh_rank].emplace(master_cell_id,
+                                                                   bbox);
+                          }
                       }
                   }
               }
           }
       }
+
 
   recv_cell_ids_neigh_cell =
     Utilities::MPI::some_to_some(communicator, local_cell_ids_neigh_cell);
@@ -1101,155 +1159,826 @@ namespace dealii
     {
     public:
       static const FEValuesBase<dim, spacedim> &
-      reinit_master(
-        const typename DoFHandler<dim, spacedim>::active_cell_iterator &cell,
-        const unsigned int face_index,
-        std::unique_ptr<NonMatching::FEImmersedSurfaceValues<spacedim>>
-                                                  &agglo_isv_ptr,
-        const AgglomerationHandler<dim, spacedim> &handler)
-      {
-        Assert(handler.is_master_cell(cell),
-               ExcMessage("This cell must be a master one."));
+        reinit_master(
+          const typename DoFHandler<dim, spacedim>::active_cell_iterator &cell,
+          const unsigned int face_index,
+          std::unique_ptr<NonMatching::FEImmersedSurfaceValues<spacedim>>
+                                                    &agglo_isv_ptr,
+          const AgglomerationHandler<dim, spacedim> &handler)
+        {
+          Assert(handler.is_master_cell(cell),
+                ExcMessage("This cell must be a master one."));
 
-        AgglomerationIterator<dim, spacedim> it{cell, &handler};
-        const auto &neigh_polytope = it->neighbor(face_index);
+          AgglomerationIterator<dim, spacedim> it{cell, &handler};
+          const auto &neigh_polytope = it->neighbor(face_index);
 
-        const CellId polytope_in_id = cell->id();
+          const CellId polytope_in_id = cell->id();
 
-        // Retrieve the bounding box of the agglomeration
-        const auto &bbox =
-          handler.bboxes[handler.master2polygon.at(cell->active_cell_index())];
+          // Retrieve the bounding box of the agglomeration
+          const auto &bbox =
+            handler.bboxes[handler.master2polygon.at(cell->active_cell_index())];
 
-        CellId polytope_out_id;
-        if (neigh_polytope.state() == IteratorState::valid)
-          polytope_out_id = neigh_polytope->id();
-        else
-          polytope_out_id = polytope_in_id; // on the boundary. Same id
+          CellId polytope_out_id;
+          if (neigh_polytope.state() == IteratorState::valid)
+            polytope_out_id = neigh_polytope->id();
+          else
+            polytope_out_id = polytope_in_id; // on the boundary. Same id
 
-        const auto &common_face = handler.polytope_cache.interface.at(
-          {polytope_in_id, polytope_out_id});
+          const auto &common_face = handler.polytope_cache.interface.at(
+            {polytope_in_id, polytope_out_id});
 
-        std::vector<Point<spacedim>> final_unit_q_points;
-        std::vector<double>          final_weights;
-        std::vector<Tensor<1, dim>>  final_normals;
+          std::vector<Point<spacedim>> final_unit_q_points;
+          std::vector<double>          final_weights;
+          std::vector<Tensor<1, dim>>  final_normals;
+          // Physical (real-space) locations of the same quadrature
+          // points, recorded purely as the sort key for the canonical
+          // reordering applied right before surface_quad is built below
+          // -- see the comment there for why.
+          std::vector<Point<spacedim>> final_real_q_points;
 
-        if (!handler.is_hp_collection)
+          if (!handler.is_hp_collection)
+            {
+              // -------------------------------------------------------------
+              // Standard DG case (Without hp::FECollection)
+              // -------------------------------------------------------------
+              for (const auto &[deal_cell, local_face_idx] : common_face)
+                {
+                  if (deal_cell->face(local_face_idx)->has_children()) 
+                    {
+                      // if the face has children, then it's the face with hanging nodes
+                      // where we've refined locally on at least one of the two sides of the interface.
+                      // In this case, we need to loop over the children
+                      const unsigned int n_subfaces = deal_cell->face(local_face_idx)->n_children();
+                      for (unsigned int subface = 0; subface < n_subfaces; ++subface)
+                        {
+                          bool integrate_this_subface = false;
+
+                          if (polytope_out_id == polytope_in_id) {
+                              // if both sides of the interface belong to the same polytope,
+                              // intergrate on all the subfaces
+                              integrate_this_subface = true;
+                          } else {
+                              // check the polytope id of each child neighbor,
+                              // and only integrate on the subface whose child neighbor belongs to the neighboring polytope
+                              auto child_neigh = deal_cell->neighbor_child_on_subface(local_face_idx, subface);
+                              if (child_neigh.state() == IteratorState::valid && child_neigh->is_active()) {
+                                  const auto child_idx = child_neigh->active_cell_index();
+                                  auto ms_it = handler.master_slave_relationships_iterators.find(child_idx);
+                                  if (ms_it != handler.master_slave_relationships_iterators.end() &&
+                                      ms_it->second->id() == polytope_out_id) {
+                                      integrate_this_subface = true;
+                                  } else if (child_neigh->is_ghost()) {
+                                      // Ghost child across MPI boundary: look up via recv_cell_ids_neigh_cell
+                                      const auto neigh_rank = child_neigh->subdomain_id();
+                                      const CellId child_id = child_neigh->id();
+                                      auto rank_it = handler.recv_cell_ids_neigh_cell.find(neigh_rank);
+                                      if (rank_it != handler.recv_cell_ids_neigh_cell.end()) {
+                                          auto cell_it = rank_it->second.find(child_id);
+                                          if (cell_it != rank_it->second.end() &&
+                                              cell_it->second == polytope_out_id) {
+                                              integrate_this_subface = true;
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+
+                          if (integrate_this_subface) {
+                              handler.no_subface_values->reinit(deal_cell, local_face_idx, subface);
+
+                              const auto &q_points = handler.no_subface_values->get_quadrature_points();
+                              const auto &JxWs     = handler.no_subface_values->get_JxW_values();
+                              const auto &normals  = handler.no_subface_values->get_normal_vectors();
+
+                              for (unsigned int q = 0; q < q_points.size(); ++q) {
+                                  final_unit_q_points.push_back(bbox.real_to_unit(q_points[q]));
+                                  final_real_q_points.push_back(q_points[q]);
+                                  final_weights.push_back(JxWs[q]);
+                                  final_normals.push_back(normals[q]);
+                              }
+                          }
+                        }
+                    }
+                  else
+                    {
+                      handler.no_face_values->reinit(deal_cell, local_face_idx);
+
+                      const auto &q_points = handler.no_face_values->get_quadrature_points();
+                      const auto &JxWs = handler.no_face_values->get_JxW_values();
+                      const auto &normals = handler.no_face_values->get_normal_vectors();
+
+                      for (unsigned int q = 0; q < q_points.size(); ++q) {
+                          final_unit_q_points.push_back(bbox.real_to_unit(q_points[q]));
+                                  final_real_q_points.push_back(q_points[q]);
+                          final_weights.push_back(JxWs[q]);
+                          final_normals.push_back(normals[q]);
+                      }
+                    }
+                }
+            }
+          else
+            {
+              // -------------------------------------------------------------
+              // Handle the hp::FECollection case
+              // -------------------------------------------------------------
+              unsigned int higher_order_quad_index = cell->active_fe_index();
+              if (neigh_polytope.state() == IteratorState::valid)
+                if (handler.agglomeration_face_quad_collection[cell->active_fe_index()].size() <
+                    handler.agglomeration_face_quad_collection[neigh_polytope->active_fe_index()].size())
+                  higher_order_quad_index = neigh_polytope->active_fe_index();
+
+              for (const auto &[deal_cell, local_face_idx] : common_face)
+                {
+                  if (deal_cell->face(local_face_idx)->has_children()) 
+                    {
+                      const unsigned int n_subfaces = deal_cell->face(local_face_idx)->n_children();
+                      for (unsigned int subface = 0; subface < n_subfaces; ++subface)
+                        {
+                          bool integrate_this_subface = false;
+                          if (polytope_out_id == polytope_in_id) {
+                              integrate_this_subface = true;
+                          } else {
+                              auto child_neigh = deal_cell->neighbor_child_on_subface(local_face_idx, subface);
+                              if (child_neigh.state() == IteratorState::valid && child_neigh->is_active()) {
+                                  const auto child_idx = child_neigh->active_cell_index();
+                                  auto ms_it = handler.master_slave_relationships_iterators.find(child_idx);
+                                  if (ms_it != handler.master_slave_relationships_iterators.end() &&
+                                      ms_it->second->id() == polytope_out_id) {
+                                      integrate_this_subface = true;
+                                  } else if (child_neigh->is_ghost()) {
+                                      const auto neigh_rank = child_neigh->subdomain_id();
+                                      const CellId child_id = child_neigh->id();
+                                      auto rank_it = handler.recv_cell_ids_neigh_cell.find(neigh_rank);
+                                      if (rank_it != handler.recv_cell_ids_neigh_cell.end()) {
+                                          auto cell_it = rank_it->second.find(child_id);
+                                          if (cell_it != rank_it->second.end() &&
+                                              cell_it->second == polytope_out_id) {
+                                              integrate_this_subface = true;
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+
+                          if (integrate_this_subface) {
+                              handler.hp_no_subface_values->reinit(deal_cell, local_face_idx, subface, higher_order_quad_index, 0, 0);
+
+                              const auto &q_points = handler.hp_no_subface_values->get_present_fe_values().get_quadrature_points();
+                              const auto &JxWs     = handler.hp_no_subface_values->get_present_fe_values().get_JxW_values();
+                              const auto &normals  = handler.hp_no_subface_values->get_present_fe_values().get_normal_vectors();
+
+                              for (unsigned int q = 0; q < q_points.size(); ++q) {
+                                  final_unit_q_points.push_back(bbox.real_to_unit(q_points[q]));
+                                  final_real_q_points.push_back(q_points[q]);
+                                  final_weights.push_back(JxWs[q]);
+                                  final_normals.push_back(normals[q]);
+                              }
+                          }
+                        }
+                    }
+                  else
+                    {
+                      handler.hp_no_face_values->reinit(deal_cell, local_face_idx, higher_order_quad_index, 0, 0);
+
+                      const auto &q_points = handler.hp_no_face_values->get_present_fe_values().get_quadrature_points();
+                      const auto &JxWs = handler.hp_no_face_values->get_present_fe_values().get_JxW_values();
+                      const auto &normals = handler.hp_no_face_values->get_present_fe_values().get_normal_vectors();
+
+                      for (unsigned int q = 0; q < q_points.size(); ++q) {
+                          final_unit_q_points.push_back(bbox.real_to_unit(q_points[q]));
+                                  final_real_q_points.push_back(q_points[q]);
+                          final_weights.push_back(JxWs[q]);
+                          final_normals.push_back(normals[q]);
+                      }
+                    }
+                }
+            }
+
+          // ---------------------------------------------------------------
+          // CANONICAL ORDERING FIX (root cause of the AMR consistency
+          // drift): the two sides of an interface each build their
+          // quadrature INDEPENDENTLY through this function
+          // (reinit_interface calls reinit_master once per side; the
+          // ghost-exchange path also flows through here via
+          // exchange_interface_values -> reinit). On an interface
+          // between polytopes at different refinement levels the two
+          // sides enumerate the same physical points in DIFFERENT
+          // orders: the coarse side expands one parent face
+          // subface-by-subface (FESubfaceValues), while the fine side
+          // visits its child faces in interface-cache insertion order
+          // (FEFaceValues). The assembly pairs the two FEValues objects
+          // pointwise by q-index, so mismatched ordering silently
+          // multiplies shape values taken at DIFFERENT physical
+          // locations (measured in adaptive.cc's [quadrature-probe]:
+          // pointwise physical mismatch up to ~0.1 while the total face
+          // measure agreed to 1e-14 -- same point set, different
+          // order). Sorting each side's points canonically by their
+          // physical coordinates makes identical point sets come out in
+          // identical order on every side, restoring the pointwise
+          // pairing the assembly relies on. The tolerance-based
+          // comparator guards axis-aligned faces: a coordinate shared
+          // by all points on a face may differ between the two sides'
+          // representations by ~1e-16 (different mappings), which must
+          // not influence the ordering; 1e-10 sits comfortably between
+          // that noise floor and the smallest physical point spacing.
           {
-            // Original version: handle case without hp::FECollection
-            const unsigned int expected_qpoints =
-              common_face.size() * handler.agglomeration_face_quad.size();
-            final_unit_q_points.reserve(expected_qpoints);
-            final_weights.reserve(expected_qpoints);
-            final_normals.reserve(expected_qpoints);
+            std::vector<unsigned int> perm(final_real_q_points.size());
+            std::iota(perm.begin(), perm.end(), 0u);
+            const double tol = 1e-10;
+            std::sort(perm.begin(),
+                      perm.end(),
+                      [&](const unsigned int a, const unsigned int b) {
+                        const Point<spacedim> &pa = final_real_q_points[a];
+                        const Point<spacedim> &pb = final_real_q_points[b];
+                        for (unsigned int d = 0; d < spacedim; ++d)
+                          {
+                            if (pa[d] < pb[d] - tol)
+                              return true;
+                            if (pa[d] > pb[d] + tol)
+                              return false;
+                            // else: equal within tolerance in this
+                            // coordinate -> defer to the next one
+                          }
+                        return false;
+                      });
 
-
-            for (const auto &[deal_cell, local_face_idx] : common_face)
+            std::vector<Point<spacedim>> sorted_unit(perm.size());
+            std::vector<double>          sorted_w(perm.size());
+            std::vector<Tensor<1, dim>>  sorted_n(perm.size());
+            for (unsigned int k = 0; k < perm.size(); ++k)
               {
-                handler.no_face_values->reinit(deal_cell, local_face_idx);
-
-                const auto &q_points =
-                  handler.no_face_values->get_quadrature_points();
-                const auto &JxWs = handler.no_face_values->get_JxW_values();
-                const auto &normals =
-                  handler.no_face_values->get_normal_vectors();
-
-                const unsigned int n_qpoints_agglo = q_points.size();
-
-                for (unsigned int q = 0; q < n_qpoints_agglo; ++q)
-                  {
-                    final_unit_q_points.push_back(
-                      bbox.real_to_unit(q_points[q]));
-                    final_weights.push_back(JxWs[q]);
-                    final_normals.push_back(normals[q]);
-                  }
+                sorted_unit[k] = final_unit_q_points[perm[k]];
+                sorted_w[k]    = final_weights[perm[k]];
+                sorted_n[k]    = final_normals[perm[k]];
               }
-          }
-        else
-          {
-            // Handle the hp::FECollection case
-            unsigned int higher_order_quad_index = cell->active_fe_index();
-            if (neigh_polytope.state() == IteratorState::valid)
-              if (handler
-                    .agglomeration_face_quad_collection[cell->active_fe_index()]
-                    .size() <
-                  handler
-                    .agglomeration_face_quad_collection[neigh_polytope
-                                                          ->active_fe_index()]
-                    .size())
-                higher_order_quad_index = neigh_polytope->active_fe_index();
-
-            const unsigned int expected_qpoints =
-              common_face.size() *
-              handler
-                .agglomeration_face_quad_collection[higher_order_quad_index]
-                .size();
-            final_unit_q_points.reserve(expected_qpoints);
-            final_weights.reserve(expected_qpoints);
-            final_normals.reserve(expected_qpoints);
-
-            for (const auto &[deal_cell, local_face_idx] : common_face)
-              {
-                handler.hp_no_face_values->reinit(
-                  deal_cell, local_face_idx, higher_order_quad_index, 0, 0);
-
-                const auto &q_points =
-                  handler.hp_no_face_values->get_present_fe_values()
-                    .get_quadrature_points();
-                const auto &JxWs =
-                  handler.hp_no_face_values->get_present_fe_values()
-                    .get_JxW_values();
-                const auto &normals =
-                  handler.hp_no_face_values->get_present_fe_values()
-                    .get_normal_vectors();
-
-                const unsigned int n_qpoints_agglo = q_points.size();
-
-                for (unsigned int q = 0; q < n_qpoints_agglo; ++q)
-                  {
-                    final_unit_q_points.push_back(
-                      bbox.real_to_unit(q_points[q]));
-                    final_weights.push_back(JxWs[q]);
-                    final_normals.push_back(normals[q]);
-                  }
-              }
+            final_unit_q_points.swap(sorted_unit);
+            final_weights.swap(sorted_w);
+            final_normals.swap(sorted_n);
           }
 
+          NonMatching::ImmersedSurfaceQuadrature<dim, spacedim> surface_quad(
+            final_unit_q_points, final_weights, final_normals);
 
-        NonMatching::ImmersedSurfaceQuadrature<dim, spacedim> surface_quad(
-          final_unit_q_points, final_weights, final_normals);
+          if (!handler.is_hp_collection)
+            {
+              agglo_isv_ptr =
+                std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
+                  *(handler.box_mapping), *(handler.fe), surface_quad, handler.agglomeration_face_flags);
+            }
+          else
+            {
+              agglo_isv_ptr =
+                std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
+                  *(handler.box_mapping), cell->get_fe(), surface_quad, handler.agglomeration_face_flags);
+            }
 
-        if (!handler.is_hp_collection)
-          {
-            agglo_isv_ptr =
-              std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
-                *(handler.box_mapping),
-                *(handler.fe),
-                surface_quad,
-                handler.agglomeration_face_flags);
-          }
-        else
-          {
-            agglo_isv_ptr =
-              std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
-                *(handler.box_mapping),
-                cell->get_fe(),
-                surface_quad,
-                handler.agglomeration_face_flags);
-          }
+          agglo_isv_ptr->reinit(cell);
 
-        agglo_isv_ptr->reinit(cell);
+          return *agglo_isv_ptr;
+        }
+      // static const FEValuesBase<dim, spacedim> &
+      // reinit_master(
+      //   const typename DoFHandler<dim, spacedim>::active_cell_iterator &cell,
+      //   const unsigned int face_index,
+      //   std::unique_ptr<NonMatching::FEImmersedSurfaceValues<spacedim>>
+      //                                             &agglo_isv_ptr,
+      //   const AgglomerationHandler<dim, spacedim> &handler)
+      // {
+      //   Assert(handler.is_master_cell(cell),
+      //          ExcMessage("This cell must be a master one."));
 
-        return *agglo_isv_ptr;
-      }
+      //   AgglomerationIterator<dim, spacedim> it{cell, &handler};
+      //   const auto &neigh_polytope = it->neighbor(face_index);
+
+      //   const CellId polytope_in_id = cell->id();
+
+      //   // Retrieve the bounding box of the agglomeration
+      //   const auto &bbox =
+      //     handler.bboxes[handler.master2polygon.at(cell->active_cell_index())];
+
+      //   CellId polytope_out_id;
+      //   if (neigh_polytope.state() == IteratorState::valid)
+      //     polytope_out_id = neigh_polytope->id();
+      //   else
+      //     polytope_out_id = polytope_in_id; // on the boundary. Same id
+
+      //   const auto &common_face = handler.polytope_cache.interface.at(
+      //     {polytope_in_id, polytope_out_id});
+
+      //   std::vector<Point<spacedim>> final_unit_q_points;
+      //   std::vector<double>          final_weights;
+      //   std::vector<Tensor<1, dim>>  final_normals;
+
+      //   if (!handler.is_hp_collection)
+      //     {
+      //       // Original version: handle case without hp::FECollection
+      //       const unsigned int expected_qpoints =
+      //         common_face.size() * handler.agglomeration_face_quad.size();
+      //       final_unit_q_points.reserve(expected_qpoints);
+      //       final_weights.reserve(expected_qpoints);
+      //       final_normals.reserve(expected_qpoints);
+
+
+      //       for (const auto &[deal_cell, local_face_idx] : common_face)
+      //         {
+      //           handler.no_face_values->reinit(deal_cell, local_face_idx);
+
+      //           const auto &q_points =
+      //             handler.no_face_values->get_quadrature_points();
+      //           const auto &JxWs = handler.no_face_values->get_JxW_values();
+      //           const auto &normals =
+      //             handler.no_face_values->get_normal_vectors();
+
+      //           const unsigned int n_qpoints_agglo = q_points.size();
+
+      //           for (unsigned int q = 0; q < n_qpoints_agglo; ++q)
+      //             {
+      //               final_unit_q_points.push_back(
+      //                 bbox.real_to_unit(q_points[q]));
+      //               final_weights.push_back(JxWs[q]);
+      //               final_normals.push_back(normals[q]);
+      //             }
+      //         }
+      //     }
+      //   else
+      //     {
+      //       // Handle the hp::FECollection case
+      //       unsigned int higher_order_quad_index = cell->active_fe_index();
+      //       if (neigh_polytope.state() == IteratorState::valid)
+      //         if (handler
+      //               .agglomeration_face_quad_collection[cell->active_fe_index()]
+      //               .size() <
+      //             handler
+      //               .agglomeration_face_quad_collection[neigh_polytope
+      //                                                     ->active_fe_index()]
+      //               .size())
+      //           higher_order_quad_index = neigh_polytope->active_fe_index();
+
+      //       const unsigned int expected_qpoints =
+      //         common_face.size() *
+      //         handler
+      //           .agglomeration_face_quad_collection[higher_order_quad_index]
+      //           .size();
+      //       final_unit_q_points.reserve(expected_qpoints);
+      //       final_weights.reserve(expected_qpoints);
+      //       final_normals.reserve(expected_qpoints);
+
+      //       for (const auto &[deal_cell, local_face_idx] : common_face)
+      //         {
+      //           handler.hp_no_face_values->reinit(
+      //             deal_cell, local_face_idx, higher_order_quad_index, 0, 0);
+
+      //           const auto &q_points =
+      //             handler.hp_no_face_values->get_present_fe_values()
+      //               .get_quadrature_points();
+      //           const auto &JxWs =
+      //             handler.hp_no_face_values->get_present_fe_values()
+      //               .get_JxW_values();
+      //           const auto &normals =
+      //             handler.hp_no_face_values->get_present_fe_values()
+      //               .get_normal_vectors();
+
+      //           const unsigned int n_qpoints_agglo = q_points.size();
+
+      //           for (unsigned int q = 0; q < n_qpoints_agglo; ++q)
+      //             {
+      //               final_unit_q_points.push_back(
+      //                 bbox.real_to_unit(q_points[q]));
+      //               final_weights.push_back(JxWs[q]);
+      //               final_normals.push_back(normals[q]);
+      //             }
+      //         }
+      //     }
+
+
+      //   NonMatching::ImmersedSurfaceQuadrature<dim, spacedim> surface_quad(
+      //     final_unit_q_points, final_weights, final_normals);
+
+      //   if (!handler.is_hp_collection)
+      //     {
+      //       agglo_isv_ptr =
+      //         std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
+      //           *(handler.box_mapping),
+      //           *(handler.fe),
+      //           surface_quad,
+      //           handler.agglomeration_face_flags);
+      //     }
+      //   else
+      //     {
+      //       agglo_isv_ptr =
+      //         std::make_unique<NonMatching::FEImmersedSurfaceValues<spacedim>>(
+      //           *(handler.box_mapping),
+      //           cell->get_fe(),
+      //           surface_quad,
+      //           handler.agglomeration_face_flags);
+      //     }
+
+      //   agglo_isv_ptr->reinit(cell);
+
+      //   return *agglo_isv_ptr;
+      // }
 
 
 
-      /**
-       * Given an agglomeration described by the master cell `master_cell`,
-       * this function:
-       * - enumerates the faces of the agglomeration
-       * - stores who is the neighbor, the local face indices from outside and
-       * inside*/
+    //   /**
+    //    * Given an agglomeration described by the master cell `master_cell`,
+    //    * this function:
+    //    * - enumerates the faces of the agglomeration
+    //    * - stores who is the neighbor, the local face indices from outside and
+    //    * inside*/
+    //   static void
+    //   setup_master_neighbor_connectivity(
+    //     const typename Triangulation<dim, spacedim>::active_cell_iterator
+    //                                               &master_cell,
+    //     const AgglomerationHandler<dim, spacedim> &handler)
+    //   {
+    //     Assert(
+    //       handler.master_slave_relationships[master_cell
+    //                                            ->global_active_cell_index()] ==
+    //         -1,
+    //       ExcMessage("The present cell with index " +
+    //                  std::to_string(master_cell->global_active_cell_index()) +
+    //                  "is not a master one."));
+
+    //     const auto &agglomeration = handler.get_agglomerate(master_cell);
+    //     const types::global_cell_index current_polytope_index =
+    //       handler.master2polygon.at(master_cell->active_cell_index());
+
+    //     CellId current_polytope_id = master_cell->id();
+
+
+    //     std::set<types::global_cell_index> visited_polygonal_neighbors;
+
+    //     std::map<unsigned int, CellId> face_to_neigh_id;
+
+    //     std::map<unsigned int, bool> is_face_at_boundary;
+
+    //     // same as above, but with CellId
+    //     std::set<CellId> visited_polygonal_neighbors_id;
+    //     unsigned int     ghost_counter = 0;
+
+    //     for (const auto &cell : agglomeration)
+    //       {
+    //         const types::global_cell_index cell_index =
+    //           cell->active_cell_index();
+
+    //         const CellId cell_id = cell->id();
+
+    //         for (const auto f : cell->face_indices())
+    //           {
+    //             const auto &neighboring_cell = cell->neighbor(f);
+
+    //             const bool valid_neighbor =
+    //               neighboring_cell.state() == IteratorState::valid;
+
+    //             if (valid_neighbor)
+    //               {
+    //                 if (neighboring_cell->is_locally_owned() &&
+    //                     !handler.are_cells_agglomerated(cell, neighboring_cell))
+    //                   {
+    //                     // - cell is not on the boundary,
+    //                     // - it's not agglomerated with the neighbor. If so,
+    //                     // it's a neighbor of the present agglomeration
+    //                     // std::cout << " (from rank) "
+    //                     //           << Utilities::MPI::this_mpi_process(
+    //                     //                handler.communicator)
+    //                     //           << std::endl;
+
+    //                     // std::cout
+    //                     //   << "neighbor locally owned? " << std::boolalpha
+    //                     //   << neighboring_cell->is_locally_owned() <<
+    //                     //   std::endl;
+    //                     // if (neighboring_cell->is_ghost())
+    //                     //   handler.ghosted_indices.push_back(
+    //                     //     neighboring_cell->active_cell_index());
+
+    //                     // a new face of the agglomeration has been
+    //                     // discovered.
+    //                     handler.polygon_boundary[master_cell].push_back(
+    //                       cell->face(f));
+
+    //                     // global index of neighboring deal.II cell
+    //                     const types::global_cell_index neighboring_cell_index =
+    //                       neighboring_cell->active_cell_index();
+
+    //                     // master cell for the neighboring polytope
+    //                     const auto &master_of_neighbor =
+    //                       handler.master_slave_relationships_iterators.at(
+    //                         neighboring_cell_index);
+
+    //                     const auto nof = cell->neighbor_of_neighbor(f);
+
+    //                     if (handler.is_slave_cell(neighboring_cell))
+    //                       {
+    //                         // index of the neighboring polytope
+    //                         const types::global_cell_index
+    //                           neighbor_polytope_index =
+    //                             handler.master2polygon.at(
+    //                               master_of_neighbor->active_cell_index());
+
+    //                         CellId neighbor_polytope_id =
+    //                           master_of_neighbor->id();
+
+    //                         if (visited_polygonal_neighbors.find(
+    //                               neighbor_polytope_index) ==
+    //                             std::end(visited_polygonal_neighbors))
+    //                           {
+    //                             // found a neighbor
+
+    //                             const unsigned int n_face =
+    //                               handler.number_of_agglomerated_faces
+    //                                 [current_polytope_index];
+
+    //                             handler.polytope_cache.cell_face_at_boundary[{
+    //                               current_polytope_index, n_face}] = {
+    //                               false, master_of_neighbor};
+
+    //                             is_face_at_boundary[n_face] = true;
+
+    //                             ++handler.number_of_agglomerated_faces
+    //                                 [current_polytope_index];
+
+    //                             visited_polygonal_neighbors.insert(
+    //                               neighbor_polytope_index);
+    //                           }
+
+
+    //                         if (handler.polytope_cache.visited_cell_and_faces
+    //                               .find({cell_index, f}) ==
+    //                             std::end(handler.polytope_cache
+    //                                        .visited_cell_and_faces))
+    //                           {
+    //                             handler.polytope_cache
+    //                               .interface[{
+    //                               current_polytope_id, neighbor_polytope_id}]
+    //                               .emplace_back(cell, f);
+
+    //                             handler.polytope_cache.visited_cell_and_faces
+    //                               .insert({cell_index, f});
+    //                           }
+
+
+    //                         if (handler.polytope_cache.visited_cell_and_faces
+    //                               .find({neighboring_cell_index, nof}) ==
+    //                             std::end(handler.polytope_cache
+    //                                        .visited_cell_and_faces))
+    //                           {
+    //                             handler.polytope_cache
+    //                               .interface[{
+    //                               neighbor_polytope_id, current_polytope_id}]
+    //                               .emplace_back(neighboring_cell, nof);
+
+    //                             handler.polytope_cache.visited_cell_and_faces
+    //                               .insert({neighboring_cell_index, nof});
+    //                           }
+    //                       }
+    //                     else
+    //                       {
+    //                         // neighboring cell is a master
+
+    //                         // save the pair of neighboring cells
+    //                         const types::global_cell_index
+    //                           neighbor_polytope_index =
+    //                             handler.master2polygon.at(
+    //                               neighboring_cell_index);
+
+    //                         CellId neighbor_polytope_id =
+    //                           neighboring_cell->id();
+
+    //                         if (visited_polygonal_neighbors.find(
+    //                               neighbor_polytope_index) ==
+    //                             std::end(visited_polygonal_neighbors))
+    //                           {
+    //                             // found a neighbor
+    //                             const unsigned int n_face =
+    //                               handler.number_of_agglomerated_faces
+    //                                 [current_polytope_index];
+
+
+    //                             handler.polytope_cache.cell_face_at_boundary[{
+    //                               current_polytope_index, n_face}] = {
+    //                               false, neighboring_cell};
+
+    //                             is_face_at_boundary[n_face] = true;
+
+    //                             ++handler.number_of_agglomerated_faces
+    //                                 [current_polytope_index];
+
+    //                             visited_polygonal_neighbors.insert(
+    //                               neighbor_polytope_index);
+    //                           }
+
+
+
+    //                         if (handler.polytope_cache.visited_cell_and_faces
+    //                               .find({cell_index, f}) ==
+    //                             std::end(handler.polytope_cache
+    //                                        .visited_cell_and_faces))
+    //                           {
+    //                             handler.polytope_cache
+    //                               .interface[{
+    //                               current_polytope_id, neighbor_polytope_id}]
+    //                               .emplace_back(cell, f);
+
+    //                             handler.polytope_cache.visited_cell_and_faces
+    //                               .insert({cell_index, f});
+    //                           }
+
+    //                         if (handler.polytope_cache.visited_cell_and_faces
+    //                               .find({neighboring_cell_index, nof}) ==
+    //                             std::end(handler.polytope_cache
+    //                                        .visited_cell_and_faces))
+    //                           {
+    //                             handler.polytope_cache
+    //                               .interface[{
+    //                               neighbor_polytope_id, current_polytope_id}]
+    //                               .emplace_back(neighboring_cell, nof);
+
+    //                             handler.polytope_cache.visited_cell_and_faces
+    //                               .insert({neighboring_cell_index, nof});
+    //                           }
+    //                       }
+    //                   }
+    //                 else if (neighboring_cell->is_ghost())
+    //                   {
+    //                     const auto nof = cell->neighbor_of_neighbor(f);
+
+    //                     // from neighboring rank,receive the association
+    //                     // between standard cell ids and neighboring polytope.
+    //                     // This tells to the current rank that the
+    //                     // neighboring cell has the following CellId as master
+    //                     // cell.
+    //                     const auto &check_neigh_poly_ids =
+    //                       handler.recv_cell_ids_neigh_cell.at(
+    //                         neighboring_cell->subdomain_id());
+
+    //                     const CellId neighboring_cell_id =
+    //                       neighboring_cell->id();
+
+    //                     const CellId &check_neigh_polytope_id =
+    //                       check_neigh_poly_ids.at(neighboring_cell_id);
+
+    //                     // const auto master_index =
+    //                     // master_indices[ghost_counter];
+
+    //                     if (visited_polygonal_neighbors_id.find(
+    //                           check_neigh_polytope_id) ==
+    //                         std::end(visited_polygonal_neighbors_id))
+    //                       {
+    //                         handler.polytope_cache.cell_face_at_boundary[{
+    //                           current_polytope_index,
+    //                           handler.number_of_agglomerated_faces
+    //                             [current_polytope_index]}] = {false,
+    //                                                           neighboring_cell};
+
+
+    //                         // record the cell id of the neighboring polytope
+    //                         handler.polytope_cache.ghosted_master_id[{
+    //                           current_polytope_id,
+    //                           handler.number_of_agglomerated_faces
+    //                             [current_polytope_index]}] =
+    //                           check_neigh_polytope_id;
+
+
+    //                         const unsigned int n_face =
+    //                           handler.number_of_agglomerated_faces
+    //                             [current_polytope_index];
+
+    //                         face_to_neigh_id[n_face] = check_neigh_polytope_id;
+
+    //                         is_face_at_boundary[n_face] = false;
+
+
+    //                         // increment number of faces
+    //                         ++handler.number_of_agglomerated_faces
+    //                             [current_polytope_index];
+
+    //                         visited_polygonal_neighbors_id.insert(
+    //                           check_neigh_polytope_id);
+
+    //                         // ghosted polytope has been found, increment
+    //                         // ghost counter
+    //                         ++ghost_counter;
+    //                       }
+
+
+
+    //                     if (handler.polytope_cache.visited_cell_and_faces_id
+    //                           .find({cell_id, f}) ==
+    //                         std::end(
+    //                           handler.polytope_cache.visited_cell_and_faces_id))
+    //                       {
+    //                         handler.polytope_cache
+    //                           .interface[{
+    //                           current_polytope_id, check_neigh_polytope_id}]
+    //                           .emplace_back(cell, f);
+
+    //                         // std::cout << "ADDED ("
+    //                         //           << cell->active_cell_index() << ")
+    //                         //           BETWEEN "
+    //                         //           << current_polytope_id << " e "
+    //                         //           << check_neigh_polytope_id <<
+    //                         //           std::endl;
+
+    //                         handler.polytope_cache.visited_cell_and_faces_id
+    //                           .insert({cell_id, f});
+    //                       }
+
+
+    //                     if (handler.polytope_cache.visited_cell_and_faces_id
+    //                           .find({neighboring_cell_id, nof}) ==
+    //                         std::end(
+    //                           handler.polytope_cache.visited_cell_and_faces_id))
+    //                       {
+    //                         handler.polytope_cache
+    //                           .interface[{
+    //                           check_neigh_polytope_id, current_polytope_id}]
+    //                           .emplace_back(neighboring_cell, nof);
+
+    //                         handler.polytope_cache.visited_cell_and_faces_id
+    //                           .insert({neighboring_cell_id, nof});
+    //                       }
+    //                   }
+    //               }
+    //             else if (cell->face(f)->at_boundary())
+    //               {
+    //                 // Boundary face of a boundary cell.
+    //                 // Note that the neighboring cell must be invalid.
+
+    //                 handler.polygon_boundary[master_cell].push_back(
+    //                   cell->face(f));
+
+    //                 if (visited_polygonal_neighbors.find(
+    //                       std::numeric_limits<unsigned int>::max()) ==
+    //                     std::end(visited_polygonal_neighbors))
+    //                   {
+    //                     // boundary face. Notice that `neighboring_cell` is
+    //                     // invalid here.
+    //                     handler.polytope_cache.cell_face_at_boundary[{
+    //                       current_polytope_index,
+    //                       handler.number_of_agglomerated_faces
+    //                         [current_polytope_index]}] = {true,
+    //                                                       neighboring_cell};
+
+    //                     const unsigned int n_face =
+    //                       handler.number_of_agglomerated_faces
+    //                         [current_polytope_index];
+
+    //                     is_face_at_boundary[n_face] = true;
+
+    //                     ++handler.number_of_agglomerated_faces
+    //                         [current_polytope_index];
+
+    //                     visited_polygonal_neighbors.insert(
+    //                       std::numeric_limits<unsigned int>::max());
+    //                   }
+
+
+
+    //                 if (handler.polytope_cache.visited_cell_and_faces.find(
+    //                       {cell_index, f}) ==
+    //                     std::end(handler.polytope_cache.visited_cell_and_faces))
+    //                   {
+    //                     handler.polytope_cache
+    //                       .interface[{
+    //                       current_polytope_id, current_polytope_id}]
+    //                       .emplace_back(cell, f);
+
+    //                     handler.polytope_cache.visited_cell_and_faces.insert(
+    //                       {cell_index, f});
+    //                   }
+    //               }
+    //           } // loop over faces
+    //       }     // loop over all cells of agglomerate
+
+
+
+    //     if (ghost_counter > 0)
+    //       {
+    //         const auto parallel_triangulation = dynamic_cast<
+    //           const dealii::parallel::TriangulationBase<dim, spacedim> *>(
+    //           &(*handler.tria));
+
+    //         const unsigned int n_faces_current_poly =
+    //           handler.number_of_agglomerated_faces[current_polytope_index];
+
+    //         // Communicate to neighboring ranks that current_polytope_id has
+    //         // a number of faces equal to n_faces_current_poly faces:
+    //         // current_polytope_id -> n_faces_current_poly
+    //         for (const unsigned int neigh_rank :
+    //              parallel_triangulation->ghost_owners())
+    //           {
+    //             handler.local_n_faces[neigh_rank].emplace(current_polytope_id,
+    //                                                       n_faces_current_poly);
+
+    //             handler.local_bdary_info[neigh_rank].emplace(
+    //               current_polytope_id, is_face_at_boundary);
+
+    //             handler.local_ghosted_master_id[neigh_rank].emplace(
+    //               current_polytope_id, face_to_neigh_id);
+    //           }
+    //       }
+    //   }
       static void
       setup_master_neighbor_connectivity(
         const typename Triangulation<dim, spacedim>::active_cell_iterator
@@ -1257,9 +1986,7 @@ namespace dealii
         const AgglomerationHandler<dim, spacedim> &handler)
       {
         Assert(
-          handler.master_slave_relationships[master_cell
-                                               ->global_active_cell_index()] ==
-            -1,
+          handler.master_slave_relationships[master_cell->global_active_cell_index()] == -1,
           ExcMessage("The present cell with index " +
                      std::to_string(master_cell->global_active_cell_index()) +
                      "is not a master one."));
@@ -1270,383 +1997,266 @@ namespace dealii
 
         CellId current_polytope_id = master_cell->id();
 
-
         std::set<types::global_cell_index> visited_polygonal_neighbors;
-
         std::map<unsigned int, CellId> face_to_neigh_id;
-
         std::map<unsigned int, bool> is_face_at_boundary;
+        // !!! Missing declaration for the hybrid-scheme global interceptor, added back !!!
+        std::set<std::tuple<types::global_cell_index, unsigned int, types::global_cell_index, unsigned int>> visited_cell_connections;
 
-        // same as above, but with CellId
         std::set<CellId> visited_polygonal_neighbors_id;
         unsigned int     ghost_counter = 0;
 
         for (const auto &cell : agglomeration)
           {
-            const types::global_cell_index cell_index =
-              cell->active_cell_index();
-
-            const CellId cell_id = cell->id();
+            // const types::global_cell_index cell_index = cell->active_cell_index();
+            // const CellId cell_id = cell->id();
 
             for (const auto f : cell->face_indices())
               {
-                const auto &neighboring_cell = cell->neighbor(f);
+                const auto &neighbor_parent = cell->neighbor(f);
 
-                const bool valid_neighbor =
-                  neighboring_cell.state() == IteratorState::valid;
-
-                if (valid_neighbor)
+                if (neighbor_parent.state() == IteratorState::valid)
                   {
-                    if (neighboring_cell->is_locally_owned() &&
-                        !handler.are_cells_agglomerated(cell, neighboring_cell))
+                    std::vector<std::pair<typename Triangulation<dim, spacedim>::active_cell_iterator, unsigned int>> active_neighbors;
+
+                    if (neighbor_parent->level() < cell->level()) {
+                        unsigned int nof = cell->neighbor_of_coarser_neighbor(f).first;
+                        active_neighbors.push_back({neighbor_parent, nof});
+                    }
+                    else if (neighbor_parent->is_active()) {
+                        active_neighbors.push_back({neighbor_parent, cell->neighbor_of_neighbor(f)});
+                    } 
+                    else {
+                        unsigned int nof = cell->neighbor_of_neighbor(f);
+                        for (unsigned int subface = 0; subface < cell->face(f)->n_children(); ++subface) {
+                            auto child_neigh = cell->neighbor_child_on_subface(f, subface);
+                            active_neighbors.push_back({child_neigh, nof});
+                        }
+                    }
+
+                    bool face_added_to_boundary = false;
+
+                    for (const auto& [neighboring_cell, nof] : active_neighbors)
                       {
-                        // - cell is not on the boundary,
-                        // - it's not agglomerated with the neighbor. If so,
-                        // it's a neighbor of the present agglomeration
-                        // std::cout << " (from rank) "
-                        //           << Utilities::MPI::this_mpi_process(
-                        //                handler.communicator)
-                        //           << std::endl;
-
-                        // std::cout
-                        //   << "neighbor locally owned? " << std::boolalpha
-                        //   << neighboring_cell->is_locally_owned() <<
-                        //   std::endl;
-                        // if (neighboring_cell->is_ghost())
-                        //   handler.ghosted_indices.push_back(
-                        //     neighboring_cell->active_cell_index());
-
-                        // a new face of the agglomeration has been
-                        // discovered.
-                        handler.polygon_boundary[master_cell].push_back(
-                          cell->face(f));
-
-                        // global index of neighboring deal.II cell
-                        const types::global_cell_index neighboring_cell_index =
-                          neighboring_cell->active_cell_index();
-
-                        // master cell for the neighboring polytope
-                        const auto &master_of_neighbor =
-                          handler.master_slave_relationships_iterators.at(
-                            neighboring_cell_index);
-
-                        const auto nof = cell->neighbor_of_neighbor(f);
-
-                        if (handler.is_slave_cell(neighboring_cell))
+                        if (neighboring_cell->is_locally_owned() &&
+                            !handler.are_cells_agglomerated(cell, neighboring_cell))
                           {
-                            // index of the neighboring polytope
-                            const types::global_cell_index
-                              neighbor_polytope_index =
-                                handler.master2polygon.at(
-                                  master_of_neighbor->active_cell_index());
+                            if (!face_added_to_boundary) {
+                                if (cell->face(f)->has_children()) {
+                                    for (unsigned int subface = 0; subface < cell->face(f)->n_children(); ++subface) {
+                                        handler.polygon_boundary[master_cell].push_back(cell->face(f)->child(subface));
+                                    }
+                                } else {
+                                    handler.polygon_boundary[master_cell].push_back(cell->face(f));
+                                }
+                                face_added_to_boundary = true;
+                            }
 
-                            CellId neighbor_polytope_id =
-                              master_of_neighbor->id();
+                            const types::global_cell_index neighboring_cell_index = neighboring_cell->active_cell_index();
+                            const auto &master_of_neighbor = handler.master_slave_relationships_iterators.at(neighboring_cell_index);
 
-                            if (visited_polygonal_neighbors.find(
-                                  neighbor_polytope_index) ==
-                                std::end(visited_polygonal_neighbors))
+                            CellId neighbor_polytope_id;
+                            types::global_cell_index neighbor_polytope_index;
+
+                            if (handler.is_slave_cell(neighboring_cell)) {
+                                neighbor_polytope_index = handler.master2polygon.at(master_of_neighbor->active_cell_index());
+                                neighbor_polytope_id = master_of_neighbor->id();
+                            } else {
+                                neighbor_polytope_index = handler.master2polygon.at(neighboring_cell_index);
+                                neighbor_polytope_id = neighboring_cell->id();
+                            }
+
+                            if (visited_polygonal_neighbors.find(neighbor_polytope_index) == std::end(visited_polygonal_neighbors))
                               {
-                                // found a neighbor
-
-                                const unsigned int n_face =
-                                  handler.number_of_agglomerated_faces
-                                    [current_polytope_index];
-
-                                handler.polytope_cache.cell_face_at_boundary[{
-                                  current_polytope_index, n_face}] = {
-                                  false, master_of_neighbor};
-
+                                const unsigned int n_face = handler.number_of_agglomerated_faces[current_polytope_index];
+                                handler.polytope_cache.cell_face_at_boundary[{current_polytope_index, n_face}] = {false, handler.is_slave_cell(neighboring_cell) ? master_of_neighbor : neighboring_cell};
                                 is_face_at_boundary[n_face] = true;
-
-                                ++handler.number_of_agglomerated_faces
-                                    [current_polytope_index];
-
-                                visited_polygonal_neighbors.insert(
-                                  neighbor_polytope_index);
+                                ++handler.number_of_agglomerated_faces[current_polytope_index];
+                                visited_polygonal_neighbors.insert(neighbor_polytope_index);
                               }
 
+                            // Use a local lookup instead of the buggy global cache
+                            // auto &iface1 = handler.polytope_cache.interface[{current_polytope_id, neighbor_polytope_id}];
+                            // bool found1 = false;
+                            // for (const auto& item : iface1) {
+                            //     if (item.first == cell && item.second == f) { found1 = true; break; }
+                            // }
+                            // if (!found1) {
+                            //     iface1.emplace_back(cell, f);
+                            // }
 
-                            if (handler.polytope_cache.visited_cell_and_faces
-                                  .find({cell_index, f}) ==
-                                std::end(handler.polytope_cache
-                                           .visited_cell_and_faces))
+                            // auto &iface2 = handler.polytope_cache.interface[{neighbor_polytope_id, current_polytope_id}];
+                            // bool found2 = false;
+                            // for (const auto& item : iface2) {
+                            //     if (item.first == neighboring_cell && item.second == nof) { found2 = true; break; }
+                            // }
+                            // if (!found2) {
+                            //     iface2.emplace_back(neighboring_cell, nof);
+                            // }
+                            // !!! HYBRID SCHEME: use the upgraded global interceptor !!!
+                            const types::global_cell_index idx1 = cell->active_cell_index();
+                            const types::global_cell_index idx2 = neighboring_cell->active_cell_index();
+
+                            // Build an undirected unique identifier (always put the
+                            // smaller index first) so both directions agree
+                            std::tuple<types::global_cell_index, unsigned int, types::global_cell_index, unsigned int> connection_key;
+                            if (idx1 < idx2) {
+                                connection_key = std::make_tuple(idx1, f, idx2, nof);
+                            } else {
+                                connection_key = std::make_tuple(idx2, nof, idx1, f);
+                            }
+
+                            // Global interceptor: only if this cell-connection pair hasn't been processed yet
+                            if (visited_cell_connections.find(connection_key) == visited_cell_connections.end()) 
                               {
-                                handler.polytope_cache
-                                  .interface[{
-                                  current_polytope_id, neighbor_polytope_id}]
-                                  .emplace_back(cell, f);
+                                auto &iface1 = handler.polytope_cache.interface[{current_polytope_id, neighbor_polytope_id}];
+                                bool found1 = false;
+                                for (const auto& item : iface1) {
+                                    if (item.first == cell && item.second == f) { found1 = true; break; }
+                                }
+                                if (!found1) iface1.emplace_back(cell, f);
 
-                                handler.polytope_cache.visited_cell_and_faces
-                                  .insert({cell_index, f});
-                              }
-
-
-                            if (handler.polytope_cache.visited_cell_and_faces
-                                  .find({neighboring_cell_index, nof}) ==
-                                std::end(handler.polytope_cache
-                                           .visited_cell_and_faces))
-                              {
-                                handler.polytope_cache
-                                  .interface[{
-                                  neighbor_polytope_id, current_polytope_id}]
-                                  .emplace_back(neighboring_cell, nof);
-
-                                handler.polytope_cache.visited_cell_and_faces
-                                  .insert({neighboring_cell_index, nof});
+                                auto &iface2 = handler.polytope_cache.interface[{neighbor_polytope_id, current_polytope_id}];
+                                bool found2 = false;
+                                for (const auto& item : iface2) {
+                                    if (item.first == neighboring_cell && item.second == nof) { found2 = true; break; }
+                                }
+                                if (!found2) iface2.emplace_back(neighboring_cell, nof);
+                                
+                                visited_cell_connections.insert(connection_key);
                               }
                           }
-                        else
+                        else if (neighboring_cell->is_ghost())
                           {
-                            // neighboring cell is a master
+                            const auto &check_neigh_poly_ids = handler.recv_cell_ids_neigh_cell.at(neighboring_cell->subdomain_id());
+                            const CellId neighboring_cell_id = neighboring_cell->id();
+                            const CellId &check_neigh_polytope_id = check_neigh_poly_ids.at(neighboring_cell_id);
 
-                            // save the pair of neighboring cells
-                            const types::global_cell_index
-                              neighbor_polytope_index =
-                                handler.master2polygon.at(
-                                  neighboring_cell_index);
-
-                            CellId neighbor_polytope_id =
-                              neighboring_cell->id();
-
-                            if (visited_polygonal_neighbors.find(
-                                  neighbor_polytope_index) ==
-                                std::end(visited_polygonal_neighbors))
+                            if (visited_polygonal_neighbors_id.find(check_neigh_polytope_id) == std::end(visited_polygonal_neighbors_id))
                               {
-                                // found a neighbor
-                                const unsigned int n_face =
-                                  handler.number_of_agglomerated_faces
-                                    [current_polytope_index];
-
-
-                                handler.polytope_cache.cell_face_at_boundary[{
-                                  current_polytope_index, n_face}] = {
-                                  false, neighboring_cell};
-
-                                is_face_at_boundary[n_face] = true;
-
-                                ++handler.number_of_agglomerated_faces
-                                    [current_polytope_index];
-
-                                visited_polygonal_neighbors.insert(
-                                  neighbor_polytope_index);
+                                handler.polytope_cache.cell_face_at_boundary[{current_polytope_index, handler.number_of_agglomerated_faces[current_polytope_index]}] = {false, neighboring_cell};
+                                handler.polytope_cache.ghosted_master_id[{current_polytope_id, handler.number_of_agglomerated_faces[current_polytope_index]}] = check_neigh_polytope_id;
+                                const unsigned int n_face = handler.number_of_agglomerated_faces[current_polytope_index];
+                                face_to_neigh_id[n_face] = check_neigh_polytope_id;
+                                is_face_at_boundary[n_face] = false;
+                                ++handler.number_of_agglomerated_faces[current_polytope_index];
+                                visited_polygonal_neighbors_id.insert(check_neigh_polytope_id);
+                                ++ghost_counter;
                               }
 
+                            // auto &iface1 = handler.polytope_cache.interface[{current_polytope_id, check_neigh_polytope_id}];
+                            // bool found1 = false;
+                            // for (const auto& item : iface1) {
+                            //     if (item.first == cell && item.second == f) { found1 = true; break; }
+                            // }
+                            // if (!found1) {
+                            //     iface1.emplace_back(cell, f);
+                            // }
 
+                            // auto &iface2 = handler.polytope_cache.interface[{check_neigh_polytope_id, current_polytope_id}];
+                            // bool found2 = false;
+                            // for (const auto& item : iface2) {
+                            //     if (item.first == neighboring_cell && item.second == nof) { found2 = true; break; }
+                            // }
+                            // if (!found2) {
+                            //     iface2.emplace_back(neighboring_cell, nof);
+                            // }
+                            const types::global_cell_index idx1 = cell->active_cell_index();
+                            const types::global_cell_index idx2 = neighboring_cell->active_cell_index();
+                            
+                            std::tuple<types::global_cell_index, unsigned int, types::global_cell_index, unsigned int> connection_key;
+                            if (idx1 < idx2) {
+                                connection_key = std::make_tuple(idx1, f, idx2, nof);
+                            } else {
+                                connection_key = std::make_tuple(idx2, nof, idx1, f);
+                            }
 
-                            if (handler.polytope_cache.visited_cell_and_faces
-                                  .find({cell_index, f}) ==
-                                std::end(handler.polytope_cache
-                                           .visited_cell_and_faces))
+                            if (visited_cell_connections.find(connection_key) == visited_cell_connections.end())
                               {
-                                handler.polytope_cache
-                                  .interface[{
-                                  current_polytope_id, neighbor_polytope_id}]
-                                  .emplace_back(cell, f);
+                                auto &iface1 = handler.polytope_cache.interface[{current_polytope_id, check_neigh_polytope_id}];
+                                bool found1 = false;
+                                for (const auto& item : iface1) {
+                                    if (item.first == cell && item.second == f) { found1 = true; break; }
+                                }
+                                if (!found1) iface1.emplace_back(cell, f);
 
-                                handler.polytope_cache.visited_cell_and_faces
-                                  .insert({cell_index, f});
+                                auto &iface2 = handler.polytope_cache.interface[{check_neigh_polytope_id, current_polytope_id}];
+                                bool found2 = false;
+                                for (const auto& item : iface2) {
+                                    if (item.first == neighboring_cell && item.second == nof) { found2 = true; break; }
+                                }
+                                if (!found2) iface2.emplace_back(neighboring_cell, nof);
+
+                                visited_cell_connections.insert(connection_key);
                               }
-
-                            if (handler.polytope_cache.visited_cell_and_faces
-                                  .find({neighboring_cell_index, nof}) ==
-                                std::end(handler.polytope_cache
-                                           .visited_cell_and_faces))
-                              {
-                                handler.polytope_cache
-                                  .interface[{
-                                  neighbor_polytope_id, current_polytope_id}]
-                                  .emplace_back(neighboring_cell, nof);
-
-                                handler.polytope_cache.visited_cell_and_faces
-                                  .insert({neighboring_cell_index, nof});
-                              }
-                          }
-                      }
-                    else if (neighboring_cell->is_ghost())
-                      {
-                        const auto nof = cell->neighbor_of_neighbor(f);
-
-                        // from neighboring rank,receive the association
-                        // between standard cell ids and neighboring polytope.
-                        // This tells to the current rank that the
-                        // neighboring cell has the following CellId as master
-                        // cell.
-                        const auto &check_neigh_poly_ids =
-                          handler.recv_cell_ids_neigh_cell.at(
-                            neighboring_cell->subdomain_id());
-
-                        const CellId neighboring_cell_id =
-                          neighboring_cell->id();
-
-                        const CellId &check_neigh_polytope_id =
-                          check_neigh_poly_ids.at(neighboring_cell_id);
-
-                        // const auto master_index =
-                        // master_indices[ghost_counter];
-
-                        if (visited_polygonal_neighbors_id.find(
-                              check_neigh_polytope_id) ==
-                            std::end(visited_polygonal_neighbors_id))
-                          {
-                            handler.polytope_cache.cell_face_at_boundary[{
-                              current_polytope_index,
-                              handler.number_of_agglomerated_faces
-                                [current_polytope_index]}] = {false,
-                                                              neighboring_cell};
-
-
-                            // record the cell id of the neighboring polytope
-                            handler.polytope_cache.ghosted_master_id[{
-                              current_polytope_id,
-                              handler.number_of_agglomerated_faces
-                                [current_polytope_index]}] =
-                              check_neigh_polytope_id;
-
-
-                            const unsigned int n_face =
-                              handler.number_of_agglomerated_faces
-                                [current_polytope_index];
-
-                            face_to_neigh_id[n_face] = check_neigh_polytope_id;
-
-                            is_face_at_boundary[n_face] = false;
-
-
-                            // increment number of faces
-                            ++handler.number_of_agglomerated_faces
-                                [current_polytope_index];
-
-                            visited_polygonal_neighbors_id.insert(
-                              check_neigh_polytope_id);
-
-                            // ghosted polytope has been found, increment
-                            // ghost counter
-                            ++ghost_counter;
-                          }
-
-
-
-                        if (handler.polytope_cache.visited_cell_and_faces_id
-                              .find({cell_id, f}) ==
-                            std::end(
-                              handler.polytope_cache.visited_cell_and_faces_id))
-                          {
-                            handler.polytope_cache
-                              .interface[{
-                              current_polytope_id, check_neigh_polytope_id}]
-                              .emplace_back(cell, f);
-
-                            // std::cout << "ADDED ("
-                            //           << cell->active_cell_index() << ")
-                            //           BETWEEN "
-                            //           << current_polytope_id << " e "
-                            //           << check_neigh_polytope_id <<
-                            //           std::endl;
-
-                            handler.polytope_cache.visited_cell_and_faces_id
-                              .insert({cell_id, f});
-                          }
-
-
-                        if (handler.polytope_cache.visited_cell_and_faces_id
-                              .find({neighboring_cell_id, nof}) ==
-                            std::end(
-                              handler.polytope_cache.visited_cell_and_faces_id))
-                          {
-                            handler.polytope_cache
-                              .interface[{
-                              check_neigh_polytope_id, current_polytope_id}]
-                              .emplace_back(neighboring_cell, nof);
-
-                            handler.polytope_cache.visited_cell_and_faces_id
-                              .insert({neighboring_cell_id, nof});
                           }
                       }
                   }
                 else if (cell->face(f)->at_boundary())
                   {
-                    // Boundary face of a boundary cell.
-                    // Note that the neighboring cell must be invalid.
+                    if (cell->face(f)->has_children()) {
+                        for (unsigned int subface = 0; subface < cell->face(f)->n_children(); ++subface) {
+                            handler.polygon_boundary[master_cell].push_back(cell->face(f)->child(subface));
+                        }
+                    } else {
+                        handler.polygon_boundary[master_cell].push_back(cell->face(f));
+                    }
 
-                    handler.polygon_boundary[master_cell].push_back(
-                      cell->face(f));
-
-                    if (visited_polygonal_neighbors.find(
-                          std::numeric_limits<unsigned int>::max()) ==
-                        std::end(visited_polygonal_neighbors))
+                    if (visited_polygonal_neighbors.find(std::numeric_limits<unsigned int>::max()) == std::end(visited_polygonal_neighbors))
                       {
-                        // boundary face. Notice that `neighboring_cell` is
-                        // invalid here.
-                        handler.polytope_cache.cell_face_at_boundary[{
-                          current_polytope_index,
-                          handler.number_of_agglomerated_faces
-                            [current_polytope_index]}] = {true,
-                                                          neighboring_cell};
-
-                        const unsigned int n_face =
-                          handler.number_of_agglomerated_faces
-                            [current_polytope_index];
-
+                        handler.polytope_cache.cell_face_at_boundary[{current_polytope_index, handler.number_of_agglomerated_faces[current_polytope_index]}] = {true, neighbor_parent};
+                        const unsigned int n_face = handler.number_of_agglomerated_faces[current_polytope_index];
                         is_face_at_boundary[n_face] = true;
-
-                        ++handler.number_of_agglomerated_faces
-                            [current_polytope_index];
-
-                        visited_polygonal_neighbors.insert(
-                          std::numeric_limits<unsigned int>::max());
+                        ++handler.number_of_agglomerated_faces[current_polytope_index];
+                        visited_polygonal_neighbors.insert(std::numeric_limits<unsigned int>::max());
                       }
 
+                    // auto &iface_b = handler.polytope_cache.interface[{current_polytope_id, current_polytope_id}];
+                    // bool found_b = false;
+                    // for (const auto& item : iface_b) {
+                    //     if (item.first == cell && item.second == f) { found_b = true; break; }
+                    // }
+                    // if (!found_b) {
+                    //     iface_b.emplace_back(cell, f);
+                    // !!! HYBRID SCHEME: dummy connection key for a boundary face !!!
+                    const types::global_cell_index idx1 = cell->active_cell_index();
+                    const types::global_cell_index idx2_dummy = std::numeric_limits<types::global_cell_index>::max();
+                    const unsigned int nof_dummy = std::numeric_limits<unsigned int>::max();
 
+                    // idx2_dummy is already this type's max value, so idx1 is always < idx2_dummy
+                    auto connection_key = std::make_tuple(idx1, f, idx2_dummy, nof_dummy);
 
-                    if (handler.polytope_cache.visited_cell_and_faces.find(
-                          {cell_index, f}) ==
-                        std::end(handler.polytope_cache.visited_cell_and_faces))
+                    if (visited_cell_connections.find(connection_key) == visited_cell_connections.end())
                       {
-                        handler.polytope_cache
-                          .interface[{
-                          current_polytope_id, current_polytope_id}]
-                          .emplace_back(cell, f);
+                        // Both ends of a boundary face's interface are itself (current_polytope_id)
+                        auto &iface_b = handler.polytope_cache.interface[{current_polytope_id, current_polytope_id}];
+                        bool found_b = false;
+                        for (const auto& item : iface_b) {
+                            if (item.first == cell && item.second == f) { found_b = true; break; }
+                        }
+                        if (!found_b) iface_b.emplace_back(cell, f);
 
-                        handler.polytope_cache.visited_cell_and_faces.insert(
-                          {cell_index, f});
+                        visited_cell_connections.insert(connection_key);  
                       }
+                    
                   }
-              } // loop over faces
-          }     // loop over all cells of agglomerate
-
-
+              }
+          }
 
         if (ghost_counter > 0)
           {
-            const auto parallel_triangulation = dynamic_cast<
-              const dealii::parallel::TriangulationBase<dim, spacedim> *>(
-              &(*handler.tria));
+            const auto parallel_triangulation = dynamic_cast<const dealii::parallel::TriangulationBase<dim, spacedim> *>(&(*handler.tria));
+            const unsigned int n_faces_current_poly = handler.number_of_agglomerated_faces[current_polytope_index];
 
-            const unsigned int n_faces_current_poly =
-              handler.number_of_agglomerated_faces[current_polytope_index];
-
-            // Communicate to neighboring ranks that current_polytope_id has
-            // a number of faces equal to n_faces_current_poly faces:
-            // current_polytope_id -> n_faces_current_poly
-            for (const unsigned int neigh_rank :
-                 parallel_triangulation->ghost_owners())
+            for (const unsigned int neigh_rank : parallel_triangulation->ghost_owners())
               {
-                handler.local_n_faces[neigh_rank].emplace(current_polytope_id,
-                                                          n_faces_current_poly);
-
-                handler.local_bdary_info[neigh_rank].emplace(
-                  current_polytope_id, is_face_at_boundary);
-
-                handler.local_ghosted_master_id[neigh_rank].emplace(
-                  current_polytope_id, face_to_neigh_id);
+                handler.local_n_faces[neigh_rank].emplace(current_polytope_id, n_faces_current_poly);
+                handler.local_bdary_info[neigh_rank].emplace(current_polytope_id, is_face_at_boundary);
+                handler.local_ghosted_master_id[neigh_rank].emplace(current_polytope_id, face_to_neigh_id);
               }
           }
       }
     };
-
-
-
   } // namespace internal
 } // namespace dealii
 

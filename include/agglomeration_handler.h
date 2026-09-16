@@ -562,6 +562,25 @@ public:
   connect_hierarchy(const CellsAgglomerator<dim, RtreeType> &agglomerator);
 
   /**
+   * Same as above, but for hierarchies that are not produced by a
+   * CellsAgglomerator: the caller supplies the parent-to-children map
+   * directly. This is what makes multilevel transfers (see
+   * Utils::fill_injection_matrix()) usable with agglomerations built by any
+   * other means -- error-driven agglomeration in an adaptive loop, a graph
+   * partitioner, or a hand-built coarsening.
+   *
+   * @p parent_child maps {parent polytope index, extraction level} to the
+   * indices of that polytope's children in the next finer handler, i.e. the
+   * exact layout AgglomerationAccessor::children() reads back.
+   */
+  void
+  connect_hierarchy(
+    const std::map<std::pair<types::global_cell_index,
+                             types::global_cell_index>,
+                   std::vector<types::global_cell_index>> &parent_child,
+    const unsigned int                                     extraction_level);
+
+  /**
    * Return the finite element collection passed to
    * distribute_agglomerated_dofs().
    */
@@ -899,6 +918,11 @@ private:
   std::unique_ptr<FEFaceValues<dim, spacedim>> no_face_values;
 
   /**
+   * Dummy FESubfaceValues, needed for subface quadratures for adaptive local refined meshes.
+   */
+  std::unique_ptr<dealii::FESubfaceValues<dim, spacedim>> no_subface_values;
+
+  /**
    * A contiguous container for all of the master cells.
    */
   std::vector<typename Triangulation<dim, spacedim>::active_cell_iterator>
@@ -942,6 +966,7 @@ private:
   // employ different FEs or quadratures
   std::unique_ptr<hp::FEValues<dim, spacedim>>     hp_no_values;
   std::unique_ptr<hp::FEFaceValues<dim, spacedim>> hp_no_face_values;
+  std::unique_ptr<hp::FESubfaceValues<dim, spacedim>> hp_no_subface_values;
 };
 
 
@@ -1255,6 +1280,20 @@ AgglomerationHandler<dim, spacedim>::connect_hierarchy(
 {
   parent_child_info        = agglomerator.parent_node_to_children_nodes;
   present_extraction_level = agglomerator.extraction_level;
+}
+
+
+
+template <int dim, int spacedim>
+inline void
+AgglomerationHandler<dim, spacedim>::connect_hierarchy(
+  const std::map<std::pair<types::global_cell_index,
+                           types::global_cell_index>,
+                 std::vector<types::global_cell_index>> &parent_child,
+  const unsigned int                                     extraction_level)
+{
+  parent_child_info        = parent_child;
+  present_extraction_level = extraction_level;
 }
 
 template <int dim, int spacedim>

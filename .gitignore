@@ -1,0 +1,10 @@
+build/
+build-release/
+doxygen/
+doc/
+
+# Run artefacts
+*.log
+*.vtu
+*.pvtu
+*.svg
