@@ -21,6 +21,27 @@ First argument:
 - `insert`: the same tree type filled by inserting cells one at a time, so the
   R* algorithm itself builds it.
 
+That `pack_rtree` packs regardless of the `rstar<4>` tag is stated in deal.II's
+documentation of the `RTree` class, `include/deal.II/numerics/rtree.h`,
+verbatim (deal.II 9.8.0-pre, lines 106-119):
+
+```cpp
+ * The optional argument @p IndexType is used only when adding elements to the
+ * tree one by one. If a range insertion is used, then the tree is built using
+ * the packing algorithm.
+ *
+ * Linear, quadratic, and rstar algorithms are available if one wants to
+ * construct the tree sequentially. However, none of these is very efficient,
+ * and users should use the packing algorithm when possible.
+ *
+ * The packing algorithm constructs the tree all at once, and may be used when
+ * you have all the leaves at your disposal.
+ *
+ * This class is usually used in combination with one of the two helper
+ * functions pack_rtree(), that takes a container or a range of iterators to
+ * construct the RTree using the packing algorithm.
+```
+
 The comment above `class pack` in Boost's
 `boost/geometry/index/detail/rtree/pack_create.hpp`, verbatim (Boost 1.84 as
 bundled with deal.II, lines 115-140):
@@ -63,8 +84,12 @@ mean polytope is closest to 64 cells).
     cp test.h rtree_45x45.cc rstar_tree.cc Polydeal/examples/
     mkdir Polydeal/build && cd Polydeal/build
     cmake -DDEAL_II_DIR=/path/to/deal.II ..
-    make rtree_45x45 rstar_tree     
-    programs
+    make rtree_45x45 rstar_tree
+    mkdir -p out/45x45 out/rstar_tree
+    (cd out/45x45      && ../../examples/rtree_45x45 pack && ../../examples/rtree_45x45 insert)
+    (cd out/rstar_tree && ../../examples/rstar_tree  pack && ../../examples/rstar_tree  insert)
+
+Each program writes into the current directory, so each mesh gets its own.
 
 ## Output (`out/<mesh>/`)
 
