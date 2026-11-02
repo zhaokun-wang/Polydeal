@@ -1,0 +1,71 @@
+# Listing of Parameters
+# ---------------------
+subsection Adaptive polytopal solver
+  subsection Adaptivity
+    # For the rule 'single': coarsen at or under this fraction of the polytope
+    # tolerance.
+    set Coarsening fraction    = 0.02
+
+    # 'multiple': as many levels per adaptation as the error indicator
+    # predicts. 'single': one level.
+    set Level rule             = multiple
+
+    # The largest number of initial cells in a polytope. It bounds the initial
+    # polytopes and every merge.
+    set Max cells per polytope = 64
+
+    # Adaptive cycles of the Poisson problem.
+    set Number of cycles       = 20
+
+    # The tolerance for the error estimator, as a fraction of the first one.
+    set Relative tolerance     = 1e-5
+  end
+
+  subsection Problem
+    # The polynomial degree of the elements.
+    set Degree                 = 4
+
+    # The initial mesh divides the unit square into this many cells per
+    # direction.
+    set Number of subdivisions = 64
+
+    # 'singular': the Poisson problem with a point singularity. 'heat': the
+    # heat equation with a moving peak.
+    set Problem                = singular
+  end
+
+  subsection Quadrature-free integration
+    # Assemble the volume and face matrices without quadrature.
+    set Use quadrature-free integration = false
+  end
+
+  subsection Repartition
+    # Solve on a copy of the mesh partitioned by ParMETIS on the graph of the
+    # polytopes.
+    set Solve on a partitioned copy = false
+  end
+
+  subsection Time stepping
+    # The final time T.
+    set Final time                 = 0.2
+
+    # Adaptations of the mesh of the initial value.
+    set Initial adaptations        = 5
+
+    # The length of the first step. Steps are not halved below 1/1024 of it.
+    set Initial step length        = 0.02
+
+    # The largest number of mesh adaptations in the loop of the first step.
+    set Max first step adaptations = 10
+
+    # Steps are not doubled beyond this length.
+    set Maximal step length        = 0.02
+
+    # The time tolerance, as a fraction of the first error estimator.
+    set Relative time tolerance    = 0.025
+
+    # Steps whose error indicator in time is under this fraction of the time
+    # tolerance are doubled.
+    set Time doubling fraction     = 0
+  end
+end
