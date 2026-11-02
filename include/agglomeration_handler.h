@@ -899,6 +899,11 @@ private:
   std::unique_ptr<FEFaceValues<dim, spacedim>> no_face_values;
 
   /**
+   * Same as above, on the subfaces of a face with hanging nodes.
+   */
+  std::unique_ptr<FESubfaceValues<dim, spacedim>> no_subface_values;
+
+  /**
    * A contiguous container for all of the master cells.
    */
   std::vector<typename Triangulation<dim, spacedim>::active_cell_iterator>
