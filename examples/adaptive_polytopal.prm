@@ -14,11 +14,12 @@ subsection Adaptive polytopal solver
     # polytopes and every merge.
     set Max cells per polytope = 64
 
-    # Adaptive cycles of the Poisson problem.
+    # The largest number of adaptive cycles of the Poisson problem.
     set Number of cycles       = 20
 
-    # The tolerance for the error estimator, as a fraction of the first one.
-    set Relative tolerance     = 1e-5
+    # The tolerance for the error estimator of the Poisson problem. The loop
+    # stops once the error estimator is at or under it.
+    set Tolerance              = 5e-5
   end
 
   subsection Problem
@@ -61,11 +62,15 @@ subsection Adaptive polytopal solver
     # Steps are not doubled beyond this length.
     set Maximal step length        = 0.02
 
-    # The time tolerance, as a fraction of the first error estimator.
-    set Relative time tolerance    = 0.025
+    # The tolerance for the error estimator in space, shared by the current
+    # polytopes.
+    set Space tolerance            = 2.5e-3
 
     # Steps whose error indicator in time is under this fraction of the time
     # tolerance are doubled.
     set Time doubling fraction     = 0
+
+    # The tolerance for the error indicator in time.
+    set Time tolerance             = 0.65
   end
 end

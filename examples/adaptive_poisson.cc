@@ -24,6 +24,7 @@
 // cell, p4est refines and coarsens the cell. The SIPG system is solved on
 // the current polytopes, and the residual error indicators of Cangiani, Dong
 // and Georgoulis mark them against a tolerance for the error estimator.
+// The loop stops once the error estimator is at or under the tolerance.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi.h>
@@ -257,7 +258,7 @@ public:
     const unsigned int                              n_subdivisions,
     const unsigned int                              degree,
     const unsigned int                              n_cycles,
-    const double                                    relative_tolerance,
+    const double                                    tolerance,
     const PolytopeAdaptivity::AdaptivityParameters &parameters,
     const MPI_Comm                                  comm);
 
@@ -315,15 +316,15 @@ private:
   const unsigned int n_subdivisions;
 
   /**
-   * Number of cycles of solving, estimating and adapting.
+   * The largest number of cycles of solving, estimating and adapting.
    */
   const unsigned int n_cycles;
 
   /**
-   * The tolerance of the error estimator as a fraction of the error estimator
-   * of the first cycle.
+   * The tolerance of the error estimator. The loop stops once the error
+   * estimator is at or under it.
    */
-  const double relative_tolerance;
+  const double tolerance;
 
   /**
    * Output on rank 0 only.
@@ -390,11 +391,9 @@ private:
   Vector<float> cell_indicators;
 
   /**
-   * The error estimator, and its tolerance, a fraction of the error
-   * estimator of the first cycle.
+   * The error estimator.
    */
   double error_estimator;
-  double tolerance;
 
   /**
    * The errors against the exact solution.
@@ -415,13 +414,13 @@ AdaptivePoissonProblem<dim>::AdaptivePoissonProblem(
   const unsigned int                              n_subdivisions,
   const unsigned int                              degree,
   const unsigned int                              n_cycles,
-  const double                                    relative_tolerance,
+  const double                                    tolerance,
   const PolytopeAdaptivity::AdaptivityParameters &parameters,
   const MPI_Comm                                  communicator)
   : comm(communicator)
   , n_subdivisions(n_subdivisions)
   , n_cycles(n_cycles)
-  , relative_tolerance(relative_tolerance)
+  , tolerance(tolerance)
   , pcout(std::cout, (Utilities::MPI::this_mpi_process(comm) == 0))
   , tria(comm,
          Triangulation<dim>::limit_level_difference_at_vertices,
@@ -430,7 +429,6 @@ AdaptivePoissonProblem<dim>::AdaptivePoissonProblem(
   , penalty_constant(2. * degree * (degree + 1))
   , polytopal_mesh(tria, degree, parameters)
   , error_estimator(0.)
-  , tolerance(-1.)
   , l2_error(0.)
   , h1_error(0.)
 {}
@@ -718,9 +716,6 @@ AdaptivePoissonProblem<dim>::estimate_and_compute_errors()
       sum_sq += cell_indicators[cell->active_cell_index()] *
                 cell_indicators[cell->active_cell_index()];
   error_estimator = std::sqrt(Utilities::MPI::sum(sum_sq, comm));
-  // The tolerance is a fraction of the error estimator of the first cycle.
-  if (tolerance < 0.)
-    tolerance = relative_tolerance * error_estimator;
 }
 
 
@@ -826,7 +821,7 @@ AdaptivePoissonProblem<dim>::run()
             << std::right << std::endl;
       // Uncomment to write the solution and the polytopes for ParaView.
       // output_results(cycle, cycle);
-      if (cycle + 1 == n_cycles)
+      if (error_estimator <= tolerance || cycle + 1 == n_cycles)
         break;
       if (!polytopal_mesh.refine_and_coarsen(
             cell_indicators, polytopal_mesh.polytope_tolerance(tolerance)))
@@ -850,11 +845,11 @@ main(int argc, char *argv[])
   parameters.max_cells_per_polytope = 64;
   parameters.level_rule = PolytopeAdaptivity::LevelRule::multiple_levels;
 
-  const unsigned int        n_subdivisions     = 64;
-  const unsigned int        degree             = 4;
-  const unsigned int        n_cycles           = 20;
-  const double              relative_tolerance = 1e-5;
+  const unsigned int        n_subdivisions = 64;
+  const unsigned int        degree         = 4;
+  const unsigned int        n_cycles       = 20;
+  const double              tolerance      = 5e-5;
   AdaptivePoissonProblem<2> problem(
-    n_subdivisions, degree, n_cycles, relative_tolerance, parameters, comm);
+    n_subdivisions, degree, n_cycles, tolerance, parameters, comm);
   problem.run();
 }

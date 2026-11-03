@@ -282,8 +282,7 @@ public:
     const unsigned int                              degree,
     const unsigned int                              n_initial_adaptations,
     const double                                    final_time,
-    const double                                    relative_tolerance,
-    const double                                    relative_time_tolerance,
+    const double                                    tolerance,
     const PolytopeAdaptivity::AdaptivityParameters &parameters,
     const TimeAdaptivity::StepControlParameters    &step_parameters,
     const MPI_Comm                                  comm);
@@ -374,12 +373,9 @@ private:
   const double final_time;
 
   /**
-   * The tolerances of the error estimator in space and of the error
-   * indicator in time, as fractions of the error estimator of the first
-   * initial value.
+   * The tolerance $\mathrm{TOL}$ of the error estimator in space.
    */
-  const double relative_tolerance;
-  const double relative_time_tolerance;
+  const double tolerance;
 
   /**
    * Output on rank 0 only.
@@ -414,8 +410,7 @@ private:
   PolytopeAdaptivity::AdaptivePolytopalMesh<dim> polytopal_mesh;
 
   /**
-   * The parameters of the step control; the time tolerance is set once the
-   * first error estimator is known.
+   * The parameters of the step control.
    */
   TimeAdaptivity::StepControlParameters step_parameters;
 
@@ -481,11 +476,10 @@ private:
   double time_indicator;
 
   /**
-   * The error estimator of the first solution, which the tolerances are
-   * fractions of, and the polytope tolerance, fixed at the first step.
+   * The tolerance of a polytope, $\mathrm{TOL}$ shared by the current
+   * polytopes, fixed at the first step.
    */
-  double reference_estimator;
-  double tolerance;
+  double polytope_tolerance;
 
   /**
    * The time of the last accepted step.
@@ -506,8 +500,7 @@ AdaptiveHeatProblem<dim>::AdaptiveHeatProblem(
   const unsigned int                              degree,
   const unsigned int                              n_initial_adaptations,
   const double                                    final_time,
-  const double                                    relative_tolerance,
-  const double                                    relative_time_tolerance,
+  const double                                    tolerance,
   const PolytopeAdaptivity::AdaptivityParameters &parameters,
   const TimeAdaptivity::StepControlParameters    &step_parameters,
   const MPI_Comm                                  communicator)
@@ -515,8 +508,7 @@ AdaptiveHeatProblem<dim>::AdaptiveHeatProblem(
   , n_subdivisions(n_subdivisions)
   , n_initial_adaptations(n_initial_adaptations)
   , final_time(final_time)
-  , relative_tolerance(relative_tolerance)
-  , relative_time_tolerance(relative_time_tolerance)
+  , tolerance(tolerance)
   , pcout(std::cout, (Utilities::MPI::this_mpi_process(comm) == 0))
   , tria(comm,
          Triangulation<dim>::limit_level_difference_at_vertices,
@@ -531,8 +523,7 @@ AdaptiveHeatProblem<dim>::AdaptiveHeatProblem(
   , error_estimator(0.)
   , max_polytope_indicator(0.)
   , time_indicator(0.)
-  , reference_estimator(-1.)
-  , tolerance(-1.)
+  , polytope_tolerance(-1.)
   , time(0.)
 {}
 
@@ -894,7 +885,7 @@ AdaptiveHeatProblem<dim>::adapt_mesh(const bool allow_refinement,
   cached_tria.reset();
   const bool adapted = polytopal_mesh.refine_and_coarsen(
     cell_indicators,
-    tolerance,
+    polytope_tolerance,
     [&]() {
       polynomial_transfer.prepare_for_coarsening_and_refinement(
         {&old_solution, &old_operator});
@@ -1021,29 +1012,23 @@ AdaptiveHeatProblem<dim>::run()
   pcout << "Running with " << Utilities::MPI::n_mpi_processes(comm)
         << " MPI ranks." << std::endl;
 
-  // The initial value, adapted against a fraction of its first error
-  // estimator shared by the current polytopes.
+  // The initial value, adapted against the tolerance shared by the current
+  // polytopes.
   initial_source.set_time(0.);
   for (unsigned int adaptation = 0;; ++adaptation)
     {
       solve_initial_value();
-      if (reference_estimator < 0.)
-        reference_estimator = error_estimator;
       pcout << "initial value: polytopes "
             << polytopal_mesh.n_global_polytopes() << ", dofs " << ah->n_dofs()
             << ", estimator " << error_estimator << std::endl;
       if (adaptation == n_initial_adaptations)
         break;
-      tolerance = polytopal_mesh.polytope_tolerance(relative_tolerance *
-                                                    reference_estimator);
+      polytope_tolerance = polytopal_mesh.polytope_tolerance(tolerance);
       adapt_mesh(true, true);
     }
   // From the first step on the polytope tolerance is a constant, as in the
   // paper: its value on the mesh of the initial value.
-  tolerance =
-    polytopal_mesh.polytope_tolerance(relative_tolerance * reference_estimator);
-  step_parameters.time_tolerance =
-    relative_time_tolerance * reference_estimator;
+  polytope_tolerance = polytopal_mesh.polytope_tolerance(tolerance);
   TimeAdaptivity::StepController controller(step_parameters);
   // Uncomment these two lines and the call in the accepted step below to
   // write the solution and the polytopes of every accepted step for
@@ -1064,8 +1049,9 @@ AdaptiveHeatProblem<dim>::run()
       const double l2_error = compute_l2_error(time + dt);
       estimate(dt);
 
-      switch (
-        controller.decide(max_polytope_indicator, tolerance, time_indicator))
+      switch (controller.decide(max_polytope_indicator,
+                                polytope_tolerance,
+                                time_indicator))
         {
           case TimeAdaptivity::StepDecision::solve_again:
             break;
@@ -1104,22 +1090,21 @@ main(int argc, char *argv[])
   PolytopeAdaptivity::AdaptivityParameters parameters;
 
   TimeAdaptivity::StepControlParameters step_parameters;
-  step_parameters.initial_dt = 0.02;
-  step_parameters.max_dt     = 0.02;
-  step_parameters.min_dt     = 0.02 / 1024.;
+  step_parameters.initial_dt     = 0.02;
+  step_parameters.max_dt         = 0.02;
+  step_parameters.min_dt         = 0.02 / 1024.;
+  step_parameters.time_tolerance = 0.65;
 
-  const unsigned int     n_subdivisions          = 64;
-  const unsigned int     degree                  = 4;
-  const unsigned int     n_initial_adaptations   = 5;
-  const double           final_time              = 0.2;
-  const double           relative_tolerance      = 1e-4;
-  const double           relative_time_tolerance = 0.025;
+  const unsigned int     n_subdivisions        = 64;
+  const unsigned int     degree                = 4;
+  const unsigned int     n_initial_adaptations = 5;
+  const double           final_time            = 0.2;
+  const double           tolerance             = 2.5e-3;
   AdaptiveHeatProblem<2> problem(n_subdivisions,
                                  degree,
                                  n_initial_adaptations,
                                  final_time,
-                                 relative_tolerance,
-                                 relative_time_tolerance,
+                                 tolerance,
                                  parameters,
                                  step_parameters,
                                  MPI_COMM_WORLD);

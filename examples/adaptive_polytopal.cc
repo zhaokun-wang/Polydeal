@@ -87,7 +87,7 @@ public:
   unsigned int max_cells_per_polytope = 64;
   std::string  level_rule             = "multiple";
   double       coarsening_fraction    = 0.02;
-  double       relative_tolerance     = 1e-5;
+  double       tolerance              = 5e-5;
   unsigned int n_cycles               = 20;
 
   /**
@@ -102,7 +102,8 @@ public:
   double       final_time                 = 0.2;
   double       initial_dt                 = 0.02;
   double       max_dt                     = 0.02;
-  double       relative_time_tolerance    = 0.025;
+  double       space_tolerance            = 2.5e-3;
+  double       time_tolerance             = 0.65;
   double       time_doubling_fraction     = 0.;
   unsigned int n_initial_adaptations      = 5;
   unsigned int max_first_step_adaptations = 10;
@@ -140,13 +141,15 @@ ProblemParameters::ProblemParameters()
                   coarsening_fraction,
                   "For the rule 'single': coarsen at or under this fraction "
                   "of the polytope tolerance.");
-    add_parameter("Relative tolerance",
-                  relative_tolerance,
-                  "The tolerance for the error estimator, as a fraction of "
-                  "the first one.");
+    add_parameter("Tolerance",
+                  tolerance,
+                  "The tolerance for the error estimator of the Poisson "
+                  "problem. The loop stops once the error estimator is at or "
+                  "under it.");
     add_parameter("Number of cycles",
                   n_cycles,
-                  "Adaptive cycles of the Poisson problem.");
+                  "The largest number of adaptive cycles of the Poisson "
+                  "problem.");
   }
   leave_subsection();
   enter_subsection("Quadrature-free integration");
@@ -174,10 +177,13 @@ ProblemParameters::ProblemParameters()
     add_parameter("Maximal step length",
                   max_dt,
                   "Steps are not doubled beyond this length.");
-    add_parameter("Relative time tolerance",
-                  relative_time_tolerance,
-                  "The time tolerance, as a fraction of the first error "
-                  "estimator.");
+    add_parameter("Space tolerance",
+                  space_tolerance,
+                  "The tolerance for the error estimator in space, shared by "
+                  "the current polytopes.");
+    add_parameter("Time tolerance",
+                  time_tolerance,
+                  "The tolerance for the error indicator in time.");
     add_parameter("Time doubling fraction",
                   time_doubling_fraction,
                   "Steps whose error indicator in time is under this "
@@ -258,7 +264,7 @@ SingularSolution<dim>::evaluate(const Point<dim> &p,
   const double r_alpha       = std::pow(r, alpha);
   const double r_alpha_minus = std::pow(r, alpha - 2.);
   u                          = window * r_alpha;
-  laplacian                  = laplacian_window * r_alpha +
+  laplacian = laplacian_window * r_alpha +
               2. * alpha * r_alpha_minus * (grad_window * offset) +
               window * alpha * (alpha + dim - 2) * r_alpha_minus;
 }
@@ -379,8 +385,8 @@ MovingPeak<dim>::evaluate(const Point<dim> &p,
 
   u               = amplitude * window * gaussian;
   laplacian       = amplitude * (laplacian_window * gaussian +
-                           2. * (grad_window * grad_gaussian) +
-                           window * laplacian_gaussian);
+                                 2. * (grad_window * grad_gaussian) +
+                                 window * laplacian_gaussian);
   time_derivative = u * 2. * k * (offset * velocity);
 }
 
@@ -731,11 +737,10 @@ private:
   double time_indicator;
 
   /**
-   * The error estimator of the first solution, which the tolerances are
-   * fractions of, and the polytope tolerance.
+   * The tolerance of a polytope: the tolerance of the error estimator
+   * shared by the current polytopes.
    */
-  double reference_estimator;
-  double tolerance;
+  double polytope_tolerance;
 
   /**
    * The time of the last accepted step.
@@ -784,8 +789,7 @@ AdaptivePolytopalProblem<dim>::AdaptivePolytopalProblem(
   , error_estimator(0.)
   , max_polytope_indicator(0.)
   , time_indicator(0.)
-  , reference_estimator(-1.)
-  , tolerance(-1.)
+  , polytope_tolerance(-1.)
   , time(0.)
 {
   AssertThrow(parameters.problem == "singular" || parameters.problem == "heat",
@@ -1256,7 +1260,7 @@ AdaptivePolytopalProblem<dim>::adapt_mesh(const bool allow_refinement,
   const bool heat    = parameters.problem == "heat";
   const bool adapted = polytopal_mesh.refine_and_coarsen(
     cell_indicators,
-    tolerance,
+    polytope_tolerance,
     [&]() {
       if (heat)
         polynomial_transfer.prepare_for_coarsening_and_refinement(
@@ -1397,8 +1401,6 @@ AdaptivePolytopalProblem<dim>::run_poisson()
       // FEValues with more quadrature points.
       const double l2_error = compute_l2_error(exact_solution);
       estimate(source, 0.);
-      if (reference_estimator < 0.)
-        reference_estimator = error_estimator;
       pcout << std::setw(5) << cycle << std::setw(11)
             << polytopal_mesh.n_global_polytopes() << std::setw(10)
             << ah->n_dofs() << "   " << std::left << std::setw(16)
@@ -1409,10 +1411,11 @@ AdaptivePolytopalProblem<dim>::run_poisson()
       // timer.stop();
       // output_results(cycle, cycle);
       // timer.start();
-      if (cycle + 1 == parameters.n_cycles)
+      if (error_estimator <= parameters.tolerance ||
+          cycle + 1 == parameters.n_cycles)
         break;
-      tolerance = polytopal_mesh.polytope_tolerance(
-        parameters.relative_tolerance * reference_estimator);
+      polytope_tolerance =
+        polytopal_mesh.polytope_tolerance(parameters.tolerance);
       adapt_mesh(true, true);
     }
 }
@@ -1427,28 +1430,25 @@ AdaptivePolytopalProblem<dim>::run_heat()
   for (unsigned int adaptation = 0;; ++adaptation)
     {
       solve_initial_value();
-      if (reference_estimator < 0.)
-        reference_estimator = error_estimator;
       pcout << "initial value: polytopes "
             << polytopal_mesh.n_global_polytopes() << ", dofs " << ah->n_dofs()
             << ", estimator " << error_estimator << std::endl;
       if (adaptation == parameters.n_initial_adaptations)
         break;
-      tolerance = polytopal_mesh.polytope_tolerance(
-        parameters.relative_tolerance * reference_estimator);
+      polytope_tolerance =
+        polytopal_mesh.polytope_tolerance(parameters.space_tolerance);
       adapt_mesh(true, true);
     }
   // From the first step on the polytope tolerance is a constant: its value
   // on the mesh of the initial value.
-  tolerance = polytopal_mesh.polytope_tolerance(parameters.relative_tolerance *
-                                                reference_estimator);
+  polytope_tolerance =
+    polytopal_mesh.polytope_tolerance(parameters.space_tolerance);
 
   TimeAdaptivity::StepControlParameters step_parameters;
-  step_parameters.initial_dt = parameters.initial_dt;
-  step_parameters.max_dt     = parameters.max_dt;
-  step_parameters.min_dt     = parameters.initial_dt / 1024.;
-  step_parameters.time_tolerance =
-    parameters.relative_time_tolerance * reference_estimator;
+  step_parameters.initial_dt             = parameters.initial_dt;
+  step_parameters.max_dt                 = parameters.max_dt;
+  step_parameters.min_dt                 = parameters.initial_dt / 1024.;
+  step_parameters.time_tolerance         = parameters.time_tolerance;
   step_parameters.time_doubling_fraction = parameters.time_doubling_fraction;
   step_parameters.max_first_step_adaptations =
     parameters.max_first_step_adaptations;
@@ -1474,8 +1474,9 @@ AdaptivePolytopalProblem<dim>::run_heat()
       const double l2_error = compute_l2_error(exact_solution);
       estimate(heat_source, dt);
 
-      switch (
-        controller.decide(max_polytope_indicator, tolerance, time_indicator))
+      switch (controller.decide(max_polytope_indicator,
+                                polytope_tolerance,
+                                time_indicator))
         {
           case TimeAdaptivity::StepDecision::solve_again:
             break;
