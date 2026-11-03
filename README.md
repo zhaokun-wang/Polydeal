@@ -87,6 +87,58 @@ mpirun -np<N> ./diffusion_reaction
 ```
 where ```N``` is the number of processors you want to use.
 
+### Adaptive polytopal meshes
+
+Four headers add adaptivity on polytopes:
+- `include/polytope_adaptivity.h`: refinement and coarsening of polytopes along
+  fixed R-trees, against a tolerance for the error estimator, one level or several
+  per adaptation. Below a single cell of the initial mesh, p4est refines and
+  coarsens the cell.
+- `include/quadrature_free_integration.h`: assembly of the SIPG volume and face
+  matrices without quadrature, from the moments of the polytopes and of their
+  interfaces.
+- `include/polytope_repartition.h`: a copy of the mesh, partitioned by ParMETIS on
+  the graph of the polytopes, on which the system is assembled and solved.
+- `include/time_adaptivity.h`: adaptive time stepping for the heat equation by
+  Algorithm 1 of Cangiani, Georgoulis and Metcalfe, and the transfer of the
+  solution through every change of the mesh.
+
+Each has an example:
+
+| Example | What it shows |
+|---|---|
+| `adaptive_poisson` | the adaptive loop on a Poisson problem with a point singularity |
+| `quadrature_free_poisson` | the matrices assembled with and without quadrature, compared degree by degree |
+| `repartitioned_poisson` | the adaptive loop solved on the partitioned copy, with the load balance of both meshes |
+| `adaptive_heat` | space and time adaptivity for the heat equation with a moving peak |
+| `adaptive_polytopal` | all of the above, selected in the parameter file `adaptive_polytopal.prm` |
+
+`repartitioned_poisson` and `adaptive_polytopal` need ParMETIS. Pass its
+installation directory when configuring:
+```bash
+cmake -DDEAL_II_DIR=/path/to/deal.II -DPARMETIS_DIR=/path/to/parmetis ..
+```
+Without it, CMake prints `ParMETIS not found` and skips these two examples.
+
+The first four examples take their parameters from `main()`.
+`adaptive_polytopal` reads `adaptive_polytopal.prm`, which CMake copies to
+`build/examples`, or the parameter file given as its first argument:
+```bash
+cd build/examples
+mpirun -np 4 ./adaptive_polytopal
+mpirun -np 4 ./adaptive_polytopal my_parameters.prm
+```
+
+The Poisson examples print one line per cycle, with the number of polytopes, the
+degrees of freedom, the error estimator and the error against the exact solution.
+The heat equation prints one line per time step, with the time, the step length,
+the number of polytopes, the degrees of freedom and the error.
+`quadrature_free_poisson` prints one line per degree, with the difference of the
+two matrices and the assembly times. To view the solution and the polytopes in
+ParaView, uncomment the calls of `output_results()` marked `Uncomment` in the
+source. Each call writes `<example>_NNNN.pvtu`, one piece per rank, and the
+series `<example>.pvd`. Colour by `polytope_colour` to see the polytopes.
+
 
 
 ## Documentation

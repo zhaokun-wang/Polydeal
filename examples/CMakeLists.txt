@@ -7,6 +7,11 @@ set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
 
 file(GLOB APP_SOURCES ./*.cc )
 
+# adaptive_polytopal reads adaptive_polytopal.prm from the working directory by
+# default, so the file is copied next to the executables.
+configure_file(adaptive_polytopal.prm
+               ${CMAKE_CURRENT_BINARY_DIR}/adaptive_polytopal.prm COPYONLY)
+
 # ParMETIS, for the examples that partition the polytope graph
 # (include/polytope_repartition.h). Pass -DPARMETIS_DIR=/path/to/parmetis, or
 # leave it empty to search the system paths; without ParMETIS these examples
