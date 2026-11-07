@@ -49,7 +49,6 @@
 
 #include <agglomeration_handler.h>
 #include <fe_agglodgp.h>
-#include <ml_MultiLevelPreconditioner.h>
 #include <poly_utils.h>
 #include <polytope_adaptivity.h>
 #include <polytope_repartition.h>
@@ -661,36 +660,11 @@ template <int dim>
 void
 RepartitionedPoissonProblem<dim>::solve()
 {
-  // deal.II's AMG for an elliptic problem: smoothed aggregation, one V-cycle,
-  // two Chebyshev sweeps and KLU on the coarsest level. Its finest level is
-  // smoothed instead by one block-Jacobi sweep with one block per polytope.
-  // The polytopes of a rank hold consecutive degrees of freedom, so the blocks
-  // are those of the linear partition. Below the finest level aggregation
-  // destroys the polytope blocks, so Chebyshev stays there.
-  const auto range      = system_matrix.local_range();
-  const int  local_rows = static_cast<int>(range.second - range.first);
-  const int  n_blocks = local_rows / static_cast<int>(fe_dg.n_dofs_per_cell());
-
+  // deal.II's AMG for an elliptic problem.
+  TrilinosWrappers::PreconditionAMG                 amg;
   TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-  amg_data.aggregation_threshold = 0.02;
-  Teuchos::ParameterList              parameters;
-  std::unique_ptr<Epetra_MultiVector> constant_modes;
-  amg_data.set_parameters(parameters,
-                          constant_modes,
-                          system_matrix.trilinos_matrix());
-  Teuchos::ParameterList &finest =
-    parameters.sublist("smoother: list (level 0)");
-  finest.set("smoother: type", "IFPACK");
-  finest.set("smoother: ifpack type", "block relaxation stand-alone");
-  finest.set("smoother: sweeps", 1);
-  Teuchos::ParameterList &ifpack = finest.sublist("smoother: ifpack list");
-  ifpack.set("relaxation: type", "Jacobi");
-  ifpack.set("relaxation: sweeps", 1);
-  ifpack.set("partitioner: type", "linear");
-  ifpack.set("partitioner: local parts", n_blocks);
-
-  TrilinosWrappers::PreconditionAMG amg;
-  amg.initialize(system_matrix, parameters);
+  amg_data.elliptic = true;
+  amg.initialize(system_matrix, amg_data);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        solver_control(10000, 1e-13, 1e-7);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(solver_control);
