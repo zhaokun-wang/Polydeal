@@ -62,6 +62,10 @@ subsection Adaptive polytopal solver
     # Steps are not doubled beyond this length.
     set Maximal step length        = 0.02
 
+    # The unit square is divided into this many squares per direction, and
+    # each holds a moving peak scaled to it.
+    set Peaks per direction        = 1
+
     # The tolerance for the error estimator in space, shared by the current
     # polytopes.
     set Space tolerance            = 2.5e-3

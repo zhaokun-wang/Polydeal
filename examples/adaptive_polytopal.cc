@@ -55,6 +55,7 @@
 #include <quadrature_free_integration.h>
 #include <time_adaptivity.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -98,6 +99,7 @@ public:
   /**
    * The time stepping of the heat equation.
    */
+  unsigned int n_peaks_per_direction      = 1;
   double       final_time                 = 0.2;
   double       initial_dt                 = 0.02;
   double       max_dt                     = 0.02;
@@ -168,6 +170,10 @@ ProblemParameters::ProblemParameters()
   leave_subsection();
   enter_subsection("Time stepping");
   {
+    add_parameter("Peaks per direction",
+                  n_peaks_per_direction,
+                  "The unit square is divided into this many squares per "
+                  "direction, and each holds a moving peak scaled to it.");
     add_parameter("Final time", final_time, "The final time T.");
     add_parameter("Initial step length",
                   initial_dt,
@@ -311,11 +317,20 @@ SingularSource<dim>::value(const Point<dim> &p, const unsigned int) const
 /**
  * $u = A\sin(\pi x)\sin(\pi y)\exp(-k|x - c(t)|^2)$, its centre moving at
  * unit speed from $(0.3, 0.3)$ to $(0.7, 0.7)$, where it stops.
+ *
+ * With $n$ peaks per direction the unit square is divided into $n \times n$
+ * squares, and each holds this function scaled to it:
+ * $u = A\sin(n\pi x)\sin(n\pi y)\sum_i \exp(-k n^2|x - c_i(t)|^2)$. The
+ * centre $c_i$ moves from $0.3$ to $0.7$ of its square along the diagonal, at
+ * speed $1/n$, so that all peaks stop at the same time as the single one. The
+ * window vanishes on the boundary of every square, so $u$ is smooth.
  */
 template <int dim>
 class MovingPeak : public Function<dim>
 {
 public:
+  MovingPeak(const unsigned int n_peaks_per_direction = 1);
+
   virtual double
   value(const Point<dim> &p, const unsigned int component = 0) const override;
 
@@ -335,7 +350,19 @@ private:
    */
   static constexpr double k         = 400.;
   static constexpr double amplitude = 5.;
+
+  /**
+   * The number $n$ of peaks per direction.
+   */
+  const unsigned int n_peaks_per_direction;
 };
+
+
+
+template <int dim>
+MovingPeak<dim>::MovingPeak(const unsigned int n_peaks_per_direction)
+  : n_peaks_per_direction(n_peaks_per_direction)
+{}
 
 
 
@@ -346,47 +373,83 @@ MovingPeak<dim>::evaluate(const Point<dim> &p,
                           double           &laplacian,
                           double           &time_derivative) const
 {
-  Point<dim> start, end;
+  // The window sin(n pi x) sin(n pi y), which vanishes on the boundary of
+  // every square.
+  const double n_pi   = n_peaks_per_direction * numbers::PI;
+  double       window = 1.;
   for (unsigned int direction = 0; direction < dim; ++direction)
-    {
-      start[direction] = 0.3;
-      end[direction]   = 0.7;
-    }
-  const double         length   = start.distance(end);
-  const double         fraction = std::min(1., this->get_time() / length);
-  const Point<dim>     centre   = start + fraction * (end - start);
-  const Tensor<1, dim> velocity =
-    (fraction < 1.) ? Tensor<1, dim>((end - start) / length) : Tensor<1, dim>();
-
-  // The window sin(pi x) sin(pi y), which vanishes on the boundary.
-  double window = 1.;
-  for (unsigned int direction = 0; direction < dim; ++direction)
-    window *= std::sin(numbers::PI * p[direction]);
+    window *= std::sin(n_pi * p[direction]);
   Tensor<1, dim> grad_window;
   for (unsigned int direction = 0; direction < dim; ++direction)
     {
-      grad_window[direction] =
-        numbers::PI * std::cos(numbers::PI * p[direction]);
+      grad_window[direction] = n_pi * std::cos(n_pi * p[direction]);
       for (unsigned int other_direction = 0; other_direction < dim;
            ++other_direction)
         if (other_direction != direction)
-          grad_window[direction] *= std::sin(numbers::PI * p[other_direction]);
+          grad_window[direction] *= std::sin(n_pi * p[other_direction]);
     }
-  const double laplacian_window = -dim * numbers::PI * numbers::PI * window;
+  const double laplacian_window = -dim * n_pi * n_pi * window;
+  const double k_n = k * n_peaks_per_direction * n_peaks_per_direction;
 
-  // The Gaussian exp(-k |x - c(t)|^2).
-  const Tensor<1, dim> offset        = p - centre;
-  const double         r_sq          = offset.norm_square();
-  const double         gaussian      = std::exp(-k * r_sq);
-  const Tensor<1, dim> grad_gaussian = -2. * k * gaussian * offset;
-  const double         laplacian_gaussian =
-    (4. * k * k * r_sq - 2. * dim * k) * gaussian;
+  // The peaks of the square containing p and of its neighbours; the others
+  // are below exp(-k (0.3 + 1)^2) ~ 1e-294 there.
+  std::array<int, dim> square;
+  for (unsigned int direction = 0; direction < dim; ++direction)
+    square[direction] = std::min(static_cast<int>(n_peaks_per_direction) - 1,
+                                 static_cast<int>(std::floor(
+                                   n_peaks_per_direction * p[direction])));
+  u               = 0.;
+  laplacian       = 0.;
+  time_derivative = 0.;
+  std::array<int, dim> shift;
+  shift.fill(-1);
+  while (true)
+    {
+      bool inside = true;
+      for (unsigned int direction = 0; direction < dim; ++direction)
+        inside = inside && square[direction] + shift[direction] >= 0 &&
+                 square[direction] + shift[direction] <
+                   static_cast<int>(n_peaks_per_direction);
+      if (inside)
+        {
+          Point<dim> start, end;
+          for (unsigned int direction = 0; direction < dim; ++direction)
+            {
+              const int corner = square[direction] + shift[direction];
+              start[direction] = (corner + 0.3) / n_peaks_per_direction;
+              end[direction]   = (corner + 0.7) / n_peaks_per_direction;
+            }
+          // The single peak's path takes 0.4 sqrt(dim); every path takes the
+          // same time.
+          const double     length = start.distance(end) * n_peaks_per_direction;
+          const double     fraction = std::min(1., this->get_time() / length);
+          const Point<dim> centre   = start + fraction * (end - start);
+          const Tensor<1, dim> velocity =
+            (fraction < 1.) ? Tensor<1, dim>((end - start) / length) :
+                              Tensor<1, dim>();
 
-  u               = amplitude * window * gaussian;
-  laplacian       = amplitude * (laplacian_window * gaussian +
-                                 2. * (grad_window * grad_gaussian) +
-                                 window * laplacian_gaussian);
-  time_derivative = u * 2. * k * (offset * velocity);
+          // The Gaussian exp(-k n^2 |x - c(t)|^2).
+          const Tensor<1, dim> offset        = p - centre;
+          const double         r_sq          = offset.norm_square();
+          const double         gaussian      = std::exp(-k_n * r_sq);
+          const Tensor<1, dim> grad_gaussian = -2. * k_n * gaussian * offset;
+          const double         laplacian_gaussian =
+            (4. * k_n * k_n * r_sq - 2. * dim * k_n) * gaussian;
+
+          const double u_peak = amplitude * window * gaussian;
+          u += u_peak;
+          laplacian += amplitude * (laplacian_window * gaussian +
+                                    2. * (grad_window * grad_gaussian) +
+                                    window * laplacian_gaussian);
+          time_derivative += u_peak * 2. * k_n * (offset * velocity);
+        }
+      unsigned int direction = 0;
+      while (direction < dim && shift[direction] == 1)
+        shift[direction++] = -1;
+      if (direction == dim)
+        break;
+      ++shift[direction];
+    }
 }
 
 
@@ -410,7 +473,8 @@ template <int dim>
 class MovingPeakSource : public Function<dim>
 {
 public:
-  MovingPeakSource(const bool stationary);
+  MovingPeakSource(const bool         stationary,
+                   const unsigned int n_peaks_per_direction);
 
   virtual double
   value(const Point<dim> &p, const unsigned int component = 0) const override;
@@ -423,8 +487,11 @@ private:
 
 
 template <int dim>
-MovingPeakSource<dim>::MovingPeakSource(const bool stationary)
+MovingPeakSource<dim>::MovingPeakSource(
+  const bool         stationary,
+  const unsigned int n_peaks_per_direction)
   : stationary(stationary)
+  , solution(n_peaks_per_direction)
 {}
 
 
@@ -792,8 +859,8 @@ AdaptivePolytopalProblem<dim>::AdaptivePolytopalProblem(
       }())
   , partitioned_copy(tria)
   , polynomial_transfer(tria)
-  , heat_source(false)
-  , initial_source(true)
+  , heat_source(false, parameters.n_peaks_per_direction)
+  , initial_source(true, parameters.n_peaks_per_direction)
   , error_estimator(0.)
   , max_polytope_indicator(0.)
   , time_indicator(0.)
@@ -1444,7 +1511,7 @@ AdaptivePolytopalProblem<dim>::run_heat()
   // unsigned int n_steps = 0;
 
   pcout << "      t        dt  polytopes      dofs   L2 error" << std::endl;
-  MovingPeak<dim> exact_solution;
+  MovingPeak<dim> exact_solution(parameters.n_peaks_per_direction);
   while (time < parameters.final_time - 1e-12)
     {
       const double dt = controller.step_length();
