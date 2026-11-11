@@ -350,7 +350,9 @@ private:
   FE_AggloDGP<dim> fe_dg;
 
   /**
-   * The penalty constant of the SIPG form, $2 p (p + 1)$.
+   * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
+   * $40/h$.
    */
   const double penalty_constant;
 
@@ -385,6 +387,12 @@ private:
    * other ranks, see PolytopeAdaptivity::locally_relevant_polytope_dofs().
    */
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
+
+  /**
+   * The ratios of boundary measure to volume of the polytopes, for the
+   * penalty, see PolytopeAdaptivity::shape_ratios().
+   */
+  TrilinosWrappers::MPI::Vector ratios;
 
   /**
    * The exact solution and the right-hand side $f = -\Delta u$.
@@ -442,7 +450,7 @@ RepartitionedPoissonProblem<dim>::RepartitionedPoissonProblem(
          Triangulation<dim>::limit_level_difference_at_vertices,
          parallel::distributed::Triangulation<dim>::no_automatic_repartitioning)
   , fe_dg(degree)
-  , penalty_constant(2. * degree * (degree + 1))
+  , penalty_constant(std::sqrt(2.) / 3. * (degree + 1) * (degree + dim))
   , polytopal_mesh(tria, degree, parameters)
   , partitioned_copy(tria)
   , p4est_imbalance(1.)
@@ -490,6 +498,7 @@ RepartitionedPoissonProblem<dim>::setup_agglomerated_problem()
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
+  ratios = PolytopeAdaptivity::shape_ratios(*ah);
 }
 
 
@@ -534,32 +543,23 @@ RepartitionedPoissonProblem<dim>::assemble_system()
                            agglo_values.JxW(q);
           }
 
-      // The measure as the sum of the quadrature weights: measure() of a
-      // cell loses all digits on cells much smaller than their distance to
-      // the origin.
-      double measure = 0.;
-      for (const unsigned int q : agglo_values.quadrature_point_indices())
-        measure += agglo_values.JxW(q);
       const double h = polytope->diameter();
+      const double ratio =
+        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
         {
           if (polytope->at_boundary(f))
             {
-              // Nitsche's method for u = 0. The penalty must dominate the two
-              // consistency terms, which grow like |F|/|P|, the length of the
-              // boundary face over the area of the polytope. The usual 1/h
-              // assumes |F|/|P| ~ 1/h, which fails for a long polytope along
-              // the boundary, so the penalty uses max(1/h, |F|/|P|) to keep the
-              // matrix positive definite.
-              const auto &fe_face      = ah->reinit(polytope, f);
-              const auto &normals      = fe_face.get_normal_vectors();
-              double      face_measure = 0.;
-              for (const unsigned int q : fe_face.quadrature_point_indices())
-                face_measure += fe_face.JxW(q);
+              // Nitsche's method for u = 0, with the penalty of
+              // PolytopeAdaptivity::boundary_penalty().
+              const auto  &fe_face = ah->reinit(polytope, f);
+              const auto  &normals = fe_face.get_normal_vectors();
               const double sigma =
-                penalty_constant * std::max(1. / h, face_measure / measure);
+                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
+                                                          h,
+                                                          ratio);
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -583,15 +583,30 @@ RepartitionedPoissonProblem<dim>::assemble_system()
             ah->reinit_interface(polytope, neighbor, f, neighbor_face);
           const auto &fe_faces0 = fe_faces.first;
           neighbor->get_dof_indices(neighbor_dof_indices);
+          // diameter() is not available for a polytope of another rank, its
+          // bounding-box diagonal is.
+          double h_neighbor;
+          if (neighbor->is_locally_owned())
+            h_neighbor = neighbor->diameter();
+          else
+            {
+              const auto corners =
+                neighbor->get_bounding_box().get_boundary_points();
+              h_neighbor = (corners.second - corners.first).norm();
+            }
+          const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
+            penalty_constant,
+            h,
+            h_neighbor,
+            ratio,
+            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
           M22 = 0.;
           if (neighbor->is_locally_owned())
             {
-              const auto  &fe_faces1 = fe_faces.second;
-              const double sigma =
-                penalty_constant / std::min(h, neighbor->diameter());
+              const auto &fe_faces1 = fe_faces.second;
               weights.resize(fe_faces0.n_quadrature_points);
               for (const unsigned int q : fe_faces0.quadrature_point_indices())
                 weights[q] = fe_faces1.JxW(q);
@@ -613,8 +628,7 @@ RepartitionedPoissonProblem<dim>::assemble_system()
           else
             {
               // The neighbour lives on another rank, which sent its shape
-              // values, gradients and weights on this face. diameter() is
-              // not available for it, its bounding-box diagonal is.
+              // values, gradients and weights on this face.
               const types::subdomain_id rank = neighbor->subdomain_id();
               const auto               &recv_values =
                 ah->recv_values.at(rank).at({neighbor->id(), neighbor_face});
@@ -622,11 +636,6 @@ RepartitionedPoissonProblem<dim>::assemble_system()
                 ah->recv_gradients.at(rank).at({neighbor->id(), neighbor_face});
               const auto &recv_jxws =
                 ah->recv_jxws.at(rank).at({neighbor->id(), neighbor_face});
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              const double sigma =
-                penalty_constant /
-                std::min(h, (corners.second - corners.first).norm());
               assemble_interface_terms<dim>(
                 M11,
                 M12,
@@ -714,6 +723,7 @@ RepartitionedPoissonProblem<dim>::estimate_and_compute_errors()
                                                   locally_relevant_solution,
                                                   rhs_function,
                                                   penalty_constant,
+                                                  ratios,
                                                   copy_indicators);
   partitioned_copy.copy_to_p4est(copy_indicators, cell_indicators);
   double sum_sq = 0.;

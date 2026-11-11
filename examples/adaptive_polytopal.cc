@@ -643,7 +643,9 @@ private:
   FE_AggloDGP<dim> fe_dg;
 
   /**
-   * The penalty constant of the SIPG form, $2 p (p + 1)$.
+   * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
+   * $40/h$.
    */
   const double penalty_constant;
 
@@ -688,6 +690,12 @@ private:
    * other ranks, see PolytopeAdaptivity::locally_relevant_polytope_dofs().
    */
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
+
+  /**
+   * The ratios of boundary measure to volume of the polytopes, for the
+   * penalty, see PolytopeAdaptivity::shape_ratios().
+   */
+  TrilinosWrappers::MPI::Vector ratios;
 
   /**
    * The solution of the last accepted step and its discrete elliptic
@@ -765,7 +773,8 @@ AdaptivePolytopalProblem<dim>::AdaptivePolytopalProblem(
          Triangulation<dim>::limit_level_difference_at_vertices,
          parallel::distributed::Triangulation<dim>::no_automatic_repartitioning)
   , fe_dg(parameters.degree)
-  , penalty_constant(2. * parameters.degree * (parameters.degree + 1))
+  , penalty_constant(std::sqrt(2.) / 3. * (parameters.degree + 1) *
+                     (parameters.degree + dim))
   , polytopal_mesh(
       tria,
       parameters.degree,
@@ -836,6 +845,7 @@ AdaptivePolytopalProblem<dim>::setup_agglomerated_problem()
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
+  ratios = PolytopeAdaptivity::shape_ratios(*ah);
 
   if (parameters.problem == "heat")
     {
@@ -915,13 +925,8 @@ AdaptivePolytopalProblem<dim>::assemble_system(
                                  cell->active_cell_index());
         }
 
-      double measure = 0.;
       for (const unsigned int q : agglo_values.quadrature_point_indices())
         {
-          // The measure as the sum of the quadrature weights: measure() of a
-          // cell loses all digits on cells much smaller than their distance
-          // to the origin.
-          measure += agglo_values.JxW(q);
           const double old_value =
             time_step ?
               TimeAdaptivity::CellPolynomial::evaluate<dim>(
@@ -954,24 +959,24 @@ AdaptivePolytopalProblem<dim>::assemble_system(
         }
 
       const double h = polytope->diameter();
+      const double ratio =
+        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
         {
           if (polytope->at_boundary(f))
             {
-              // Nitsche's method for u = 0. The penalty must dominate the two
-              // consistency terms, which grow like |F|/|P|, the length of the
-              // boundary face over the area of the polytope. The usual 1/h
-              // assumes |F|/|P| ~ 1/h, which fails for a long polytope along
-              // the boundary, so the penalty uses max(1/h, |F|/|P|) to keep the
-              // matrix positive definite.
+              // Nitsche's method for u = 0, with the penalty of
+              // PolytopeAdaptivity::boundary_penalty().
               if (integrator)
                 {
-                  const double face_measure = integrator->face_matrices(
+                  integrator->face_matrices(
                     *ah, polytope, f, face_mass, face_flux);
                   const double sigma =
-                    penalty_constant * std::max(1. / h, face_measure / measure);
+                    PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
+                                                              h,
+                                                              ratio);
                   for (unsigned int i = 0; i < n_dofs; ++i)
                     for (unsigned int j = 0; j < n_dofs; ++j)
                       cell_matrix(i, j) +=
@@ -979,13 +984,12 @@ AdaptivePolytopalProblem<dim>::assemble_system(
                                  sigma * face_mass(i, j));
                   continue;
                 }
-              const auto &fe_face      = ah->reinit(polytope, f);
-              const auto &normals      = fe_face.get_normal_vectors();
-              double      face_measure = 0.;
-              for (const unsigned int q : fe_face.quadrature_point_indices())
-                face_measure += fe_face.JxW(q);
+              const auto  &fe_face = ah->reinit(polytope, f);
+              const auto  &normals = fe_face.get_normal_vectors();
               const double sigma =
-                penalty_constant * std::max(1. / h, face_measure / measure);
+                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
+                                                          h,
+                                                          ratio);
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -1018,11 +1022,16 @@ AdaptivePolytopalProblem<dim>::assemble_system(
                 neighbor->get_bounding_box().get_boundary_points();
               h_neighbor = (corners.second - corners.first).norm();
             }
-          const double sigma = penalty_constant / std::min(h, h_neighbor);
-          M11                = 0.;
-          M12                = 0.;
-          M21                = 0.;
-          M22                = 0.;
+          const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
+            penalty_constant,
+            h,
+            h_neighbor,
+            ratio,
+            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+          M11 = 0.;
+          M12 = 0.;
+          M21 = 0.;
+          M22 = 0.;
           if (integrator)
             {
               integrator->face_matrices(*ah, polytope, f, face_mass, face_flux);
@@ -1150,6 +1159,7 @@ AdaptivePolytopalProblem<dim>::estimate(const Function<dim> &rhs_function,
     locally_relevant_solution,
     rhs_function,
     penalty_constant,
+    ratios,
     indicators_on_system_mesh,
     time_step ? time_derivative : decltype(time_derivative)());
 

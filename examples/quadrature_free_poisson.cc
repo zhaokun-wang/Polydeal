@@ -49,6 +49,7 @@
 #include <agglomerator.h>
 #include <fe_agglodgp.h>
 #include <poly_utils.h>
+#include <polytope_adaptivity.h>
 #include <quadrature_free_integration.h>
 
 #include <cmath>
@@ -324,6 +325,12 @@ private:
   TrilinosWrappers::MPI::Vector     solution;
 
   /**
+   * The ratios of boundary measure to volume of the polytopes, for the
+   * penalty, see PolytopeAdaptivity::shape_ratios().
+   */
+  TrilinosWrappers::MPI::Vector ratios;
+
+  /**
    * The exact solution and the right-hand side.
    */
   Solution<dim>      exact_solution;
@@ -392,6 +399,7 @@ QuadratureFreePoissonProblem<dim>::setup_agglomerated_problem(
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
+  ratios = PolytopeAdaptivity::shape_ratios(*ah);
   ah->create_agglomeration_sparsity_pattern(sparsity);
 }
 
@@ -406,7 +414,8 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
 {
   matrix.reinit(sparsity);
   system_rhs.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
-  const double penalty_constant = 2. * fe_dg.degree * (fe_dg.degree + 1);
+  const double penalty_constant =
+    std::sqrt(2.) / 3. * (fe_dg.degree + 1) * (fe_dg.degree + dim);
 
   std::vector<FullMatrix<double>> stiffness;
   if (integrator != nullptr)
@@ -445,44 +454,37 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
       if (integrator != nullptr)
         cell_matrix = stiffness[polytope->index()];
 
-      // The measure as the sum of the quadrature weights: measure() of a
-      // cell loses all digits on cells much smaller than their distance to
-      // the origin.
-      double measure = 0.;
-      for (const unsigned int q : agglo_values.quadrature_point_indices())
-        measure += agglo_values.JxW(q);
       const double h = polytope->diameter();
+      const double ratio =
+        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
         {
           if (polytope->at_boundary(f))
             {
-              // Nitsche's method for u = 0. The penalty must dominate the two
-              // consistency terms, which grow like |F|/|P|, the length of the
-              // boundary face over the area of the polytope. The usual 1/h
-              // assumes |F|/|P| ~ 1/h, which fails for a long polytope along
-              // the boundary, so the penalty uses max(1/h, |F|/|P|) to keep the
-              // matrix positive definite.
+              // Nitsche's method for u = 0, with the penalty of
+              // PolytopeAdaptivity::boundary_penalty().
               if (integrator != nullptr)
                 {
-                  const double face_measure = integrator->face_matrices(
+                  integrator->face_matrices(
                     *ah, polytope, f, face_mass, face_flux);
                   const double sigma =
-                    penalty_constant * std::max(1. / h, face_measure / measure);
+                    PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
+                                                              h,
+                                                              ratio);
                   for (unsigned int i = 0; i < n_dofs; ++i)
                     for (unsigned int j = 0; j < n_dofs; ++j)
                       cell_matrix(i, j) += -face_flux(i, j) - face_flux(j, i) +
                                            sigma * face_mass(i, j);
                   continue;
                 }
-              const auto &fe_face      = ah->reinit(polytope, f);
-              const auto &normals      = fe_face.get_normal_vectors();
-              double      face_measure = 0.;
-              for (const unsigned int q : fe_face.quadrature_point_indices())
-                face_measure += fe_face.JxW(q);
+              const auto  &fe_face = ah->reinit(polytope, f);
+              const auto  &normals = fe_face.get_normal_vectors();
               const double sigma =
-                penalty_constant * std::max(1. / h, face_measure / measure);
+                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
+                                                          h,
+                                                          ratio);
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -512,11 +514,16 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
                 neighbor->get_bounding_box().get_boundary_points();
               h_neighbor = (corners.second - corners.first).norm();
             }
-          const double sigma = penalty_constant / std::min(h, h_neighbor);
-          M11                = 0.;
-          M12                = 0.;
-          M21                = 0.;
-          M22                = 0.;
+          const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
+            penalty_constant,
+            h,
+            h_neighbor,
+            ratio,
+            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+          M11 = 0.;
+          M12 = 0.;
+          M21 = 0.;
+          M22 = 0.;
           if (integrator != nullptr)
             {
               integrator->face_matrices(*ah, polytope, f, face_mass, face_flux);

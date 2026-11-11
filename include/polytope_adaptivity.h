@@ -27,6 +27,7 @@
 #include <deal.II/distributed/p4est_wrappers.h>
 #include <deal.II/distributed/tria.h>
 
+#include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_values.h>
 
 #include <deal.II/lac/trilinos_vector.h>
@@ -44,6 +45,7 @@
 #include <functional>
 #include <map>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1395,6 +1397,154 @@ namespace dealii::PolytopeAdaptivity
 
 
   /**
+   * The ratio $|\partial P| / |P|$ of boundary measure to volume of every
+   * polytope that a locally owned polytope sees: its own and those of its
+   * neighbours on other ranks. It measures how thin a polytope is. The ratio
+   * of a polytope is stored in the entry of its first degree of freedom, so
+   * that the vector has the layout of a solution vector with the ghost entries
+   * of locally_relevant_polytope_dofs(): the ghost update of this vector
+   * brings the ratio of a neighbour on another rank, as the ghost update of a
+   * solution vector brings its coefficients.
+   *
+   * A face of a cell lies on $\partial P$ if it is on the boundary of the
+   * domain or its neighbour is not a cell of $P$. A polytope of two or more
+   * cells consists of initial cells that are not refined, so a neighbour that
+   * is refined lies outside it. Measures are sums of quadrature weights:
+   * CellAccessor::measure() loses all digits on cells much smaller than their
+   * distance to the origin. Two Gauss points per direction integrate the
+   * Jacobian determinant of a multilinear cell or face exactly.
+   */
+  template <int dim>
+  TrilinosWrappers::MPI::Vector
+  shape_ratios(const AgglomerationHandler<dim> &ah)
+  {
+    const MPI_Comm  comm = ah.get_triangulation().get_mpi_communicator();
+    FE_Nothing<dim> fe_nothing;
+    FEValues<dim>   fe_values(ah.get_mapping(),
+                            fe_nothing,
+                            QGauss<dim>(2),
+                            update_JxW_values);
+    FEFaceValues<dim> fe_face_values(ah.get_mapping(),
+                                     fe_nothing,
+                                     QGauss<dim - 1>(2),
+                                     update_JxW_values);
+    TrilinosWrappers::MPI::Vector owned(ah.agglo_dh.locally_owned_dofs(), comm);
+    std::vector<types::global_dof_index> dof_indices(ah.get_fe().dofs_per_cell);
+    std::set<CellId>                     cells_of_polytope;
+    for (const auto &polytope : ah.polytope_iterators())
+      if (polytope->is_locally_owned())
+        {
+          cells_of_polytope.clear();
+          for (const auto &cell : polytope->get_agglomerate())
+            cells_of_polytope.insert(cell->id());
+          double volume = 0., boundary = 0.;
+          for (const auto &cell : polytope->get_agglomerate())
+            {
+              fe_values.reinit(cell);
+              for (const unsigned int q : fe_values.quadrature_point_indices())
+                volume += fe_values.JxW(q);
+              for (const unsigned int f : cell->face_indices())
+                if (cell->at_boundary(f) || cell->neighbor(f)->has_children() ||
+                    cells_of_polytope.count(cell->neighbor(f)->id()) == 0)
+                  {
+                    fe_face_values.reinit(cell, f);
+                    for (const unsigned int q :
+                         fe_face_values.quadrature_point_indices())
+                      boundary += fe_face_values.JxW(q);
+                  }
+            }
+          polytope->get_dof_indices(dof_indices);
+          owned(dof_indices[0]) = boundary / volume;
+        }
+    owned.compress(VectorOperation::insert);
+    TrilinosWrappers::MPI::Vector ratios(ah.agglo_dh.locally_owned_dofs(),
+                                         locally_relevant_polytope_dofs(ah),
+                                         comm);
+    ratios = owned;
+    return ratios;
+  }
+
+
+
+  /**
+   * The ratio $|\partial P| / |P|$ of @p polytope from the vector of
+   * shape_ratios(). The polytope is locally owned or a neighbour of a locally
+   * owned one.
+   */
+  template <int dim, typename PolytopeIterator>
+  double
+  shape_ratio(const AgglomerationHandler<dim>     &ah,
+              const TrilinosWrappers::MPI::Vector &ratios,
+              const PolytopeIterator              &polytope)
+  {
+    std::vector<types::global_dof_index> dof_indices(ah.get_fe().dofs_per_cell);
+    polytope->get_dof_indices(dof_indices);
+    return ratios(dof_indices[0]);
+  }
+
+
+
+  /**
+   * The SIPG penalty on an interior face between polytopes $P$ and $P'$,
+   * @f[
+   *   \sigma_F = C \max_{K \in \{P, P'\}}
+   *     \max\left( \frac{2\sqrt{d}}{h_K}, \frac{|\partial K|}{d\,|K|} \right),
+   * @f]
+   * with $C$ = @p penalty_constant, which contains $(p+1)(p+d)$, and the
+   * ratios @p ratio and @p ratio_neighbor from shape_ratios(). This is the
+   * penalty of Cangiani, Dong and Georgoulis (2023, eq. 2.16) with the
+   * constant $\tau$ of the inverse trace inequality taken polytope by
+   * polytope: their $C_\mathrm{inv}/h_K = \tau_K (p+1)(p+d)/h_K$, and for a
+   * convex polytope the best $\tau_K/h_K$ is $1/r_K$, the inverse of the
+   * inscribed radius. Both arguments of the maximum stand for $1/r_K$.
+   * $2\sqrt{d}/h_K$ is its value on a square or a cube, and
+   * $|\partial K|/(d|K|)$ is a lower bound for every convex polytope
+   * (Sewell 2024, arXiv:2401.03593, Prop. 2: $1/r_K$ lies between
+   * $|\partial K|/(d|K|)$ and $|\partial K|/|K|$), equal to $1/r_K$ on a
+   * square or a cube. The second argument takes over on a long thin
+   * polytope: a strip of width $w$ has $|\partial K|/|K| \approx 2/w$
+   * however long it is, while $1/h_K$ falls with its length, and with
+   * $1/h_K$ alone the matrix is not positive definite. The ratio of the whole
+   * polytope, not of the face, is used because the long side of a strip is
+   * split into many short faces, one for each neighbour. Both sides of the
+   * face see the same value.
+   */
+  template <int dim>
+  double
+  interior_penalty(const double penalty_constant,
+                   const double h,
+                   const double h_neighbor,
+                   const double ratio,
+                   const double ratio_neighbor)
+  {
+    return penalty_constant *
+           std::max(2. * std::sqrt(double(dim)) / std::min(h, h_neighbor),
+                    std::max(ratio, ratio_neighbor) / dim);
+  }
+
+
+
+  /**
+   * The SIPG penalty on a face of polytope $P$ on the boundary,
+   * @f[
+   *   \sigma_F = C \max\left( \frac{2\sqrt{d}}{h_P},
+   *     \frac{|\partial P|}{d\,|P|} \right),
+   * @f]
+   * the one of interior_penalty() with $P$ alone.
+   */
+  template <int dim>
+  double
+  boundary_penalty(const double penalty_constant,
+                   const double h,
+                   const double ratio)
+  {
+    return penalty_constant *
+           std::max(2. * std::sqrt(double(dim)) / h, ratio / dim);
+  }
+
+
+
+  /**
    * Residual error indicator of Cangiani, Dong and Georgoulis (2023, Thm 3.5,
    * (3.21)) for the SIPG discretization of $-\Delta u = f$ with $u = 0$ on
    * the boundary, written into @p cell_indicators for every locally owned
@@ -1406,11 +1556,11 @@ namespace dealii::PolytopeAdaptivity
    * @f]
    * the full gradient jump comprising the normal and the tangential term of
    * the paper, with $u_h$ itself as the jump on the boundary. $\sigma_F$ is
-   * the penalty of the assembly: @p penalty_constant over the smaller
-   * diameter on an interior face, @p penalty_constant times
-   * $\max(1/h_P, |F|/|P|)$ on the boundary. The error indicators are stored
-   * on the cells: each of the $n_P$ cells of $P$ gets $\eta_P / \sqrt{n_P}$,
-   * so that the squares over the cells of $P$ sum to $\eta_P^2$.
+   * the penalty of the assembly: interior_penalty() on an interior face and
+   * boundary_penalty() on the boundary, with the ratios of the polytopes from
+   * @p ratios (see shape_ratios()). The error indicators are stored on the
+   * cells: each of the $n_P$ cells of $P$ gets $\eta_P / \sqrt{n_P}$, so
+   * that the squares over the cells of $P$ sum to $\eta_P^2$.
    *
    * Every locally owned polytope adds its volume term and the terms of its
    * faces, of which there are three kinds. A face on the boundary adds the
@@ -1438,6 +1588,7 @@ namespace dealii::PolytopeAdaptivity
     const TrilinosWrappers::MPI::Vector &solution,
     const Function<dim>                 &rhs_function,
     const double                         penalty_constant,
+    const TrilinosWrappers::MPI::Vector &ratios,
     Vector<float>                       &cell_indicators,
     const std::function<
       double(const typename Triangulation<dim>::active_cell_iterator &,
@@ -1465,11 +1616,8 @@ namespace dealii::PolytopeAdaptivity
     std::vector<double>                  values_here, values_there;
     std::vector<Tensor<1, dim>>          gradients_here, gradients_there;
 
-    // Squared error indicator and measure of every locally owned polytope.
-    // The measure is a sum of quadrature weights: CellAccessor::measure()
-    // loses all digits on cells much smaller than their distance to the
-    // origin.
-    std::map<unsigned int, double> error_sq, polytope_measure;
+    // Squared error indicator of every locally owned polytope.
+    std::map<unsigned int, double> error_sq;
 
     const auto tangential_sq = [](const Tensor<1, dim> &v,
                                   const Tensor<1, dim> &normal) {
@@ -1482,11 +1630,11 @@ namespace dealii::PolytopeAdaptivity
           continue;
         const double h = polytope->diameter();
 
-        // 1. The volume term $h_P^2 \| f + \Delta u_h \|_P^2$, and the
-        // measure of the polytope. The quadrature of the handler on a polytope
-        // lists the points of its cells one cell after the other, in the order
-        // of get_agglomerate(). The loop over the cells is only there because
-        // @p volume_source needs the cell of every point.
+        // 1. The volume term $h_P^2 \| f + \Delta u_h \|_P^2$. The quadrature
+        // of the handler on a polytope lists the points of its cells one cell
+        // after the other, in the order of get_agglomerate(). The loop over the
+        // cells is only there because @p volume_source needs the cell of every
+        // point.
         const auto &fe_values = ah.reinit(polytope);
         const auto &points    = fe_values.get_quadrature_points();
         rhs_values.resize(points.size());
@@ -1498,7 +1646,7 @@ namespace dealii::PolytopeAdaptivity
             u_values.resize(points.size());
             fe_values.get_function_values(solution, u_values);
           }
-        double       volume_sq = 0., measure = 0.;
+        double       volume_sq = 0.;
         unsigned int q = 0;
         for (const auto &cell : polytope->get_agglomerate())
           for (const unsigned int end = q + n_q_cell; q < end; ++q)
@@ -1507,18 +1655,16 @@ namespace dealii::PolytopeAdaptivity
               if (volume_source)
                 residual += volume_source(cell, points[q], u_values[q]);
               volume_sq += residual * residual * fe_values.JxW(q);
-              measure += fe_values.JxW(q);
             }
         AssertDimension(q, points.size());
         error_sq[polytope->index()] += h * h * volume_sq;
-        polytope_measure[polytope->index()] = measure;
 
         for (unsigned int f = 0; f < polytope->n_faces(); ++f)
           {
             // 2. A face on the boundary. The jump of the value is $u_h$
             // itself, and the gradient jump is the tangential part of
             // $\nabla u_h$. The penalty is that of the assembly on the
-            // boundary, which needs the measure of the polytope from step 1.
+            // boundary.
             if (polytope->at_boundary(f))
               {
                 const auto &face_values = ah.reinit(polytope, f);
@@ -1527,7 +1673,7 @@ namespace dealii::PolytopeAdaptivity
                 gradients_here.resize(face_values.n_quadrature_points);
                 face_values.get_function_values(solution, values_here);
                 face_values.get_function_gradients(solution, gradients_here);
-                double value_sq = 0., gradient_sq = 0., face_measure = 0.;
+                double value_sq = 0., gradient_sq = 0.;
                 for (const unsigned int q :
                      face_values.quadrature_point_indices())
                   {
@@ -1536,12 +1682,11 @@ namespace dealii::PolytopeAdaptivity
                     gradient_sq +=
                       tangential_sq(gradients_here[q], normals[q]) *
                       face_values.JxW(q);
-                    face_measure += face_values.JxW(q);
                   }
-                const double sigma =
-                  penalty_constant *
-                  std::max(1. / h,
-                           face_measure / polytope_measure[polytope->index()]);
+                const double sigma = boundary_penalty<dim>(
+                  penalty_constant,
+                  h,
+                  shape_ratio(ah, ratios, polytope));
                 error_sq[polytope->index()] +=
                   sigma * value_sq + h * gradient_sq;
                 continue;
@@ -1626,7 +1771,12 @@ namespace dealii::PolytopeAdaptivity
                 gradient_sq += gradient_jump.norm_square() * weight;
                 value_sq += value_jump * value_jump * weight;
               }
-            const double sigma = penalty_constant / std::min(h, h_neighbor);
+            const double sigma = interior_penalty<dim>(
+              penalty_constant,
+              h,
+              h_neighbor,
+              shape_ratio(ah, ratios, polytope),
+              shape_ratio(ah, ratios, neighbor));
             error_sq[polytope->index()] += h * gradient_sq + sigma * value_sq;
             if (!ghost)
               error_sq[neighbor->index()] +=
