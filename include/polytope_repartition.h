@@ -377,11 +377,33 @@ namespace dealii::PolytopeRepartition
           copy_partition[cell->global_active_cell_index()] = rank;
       }
 
-    // Build the copy: every cell goes to the rank of its polytope.
+    // Build the copy: every cell goes to the rank of its polytope. The
+    // description lists the coarse cells in the order in which the messages
+    // of the other ranks arrived, and the degrees of freedom are numbered in
+    // the order of the cells. The coarse cells are therefore sorted by their
+    // id, so that the numbering, and with it the linear solver, is the same
+    // in every run.
+    auto description = TriangulationDescription::Utilities::
+      create_description_from_triangulation(p4est_tria, copy_partition);
+    {
+      std::vector<unsigned int> order(description.coarse_cells.size());
+      for (unsigned int i = 0; i < order.size(); ++i)
+        order[i] = i;
+      std::sort(order.begin(), order.end(), [&](const auto a, const auto b) {
+        return description.coarse_cell_index_to_coarse_cell_id[a] <
+               description.coarse_cell_index_to_coarse_cell_id[b];
+      });
+      auto coarse_cells = description.coarse_cells;
+      auto coarse_ids   = description.coarse_cell_index_to_coarse_cell_id;
+      for (unsigned int i = 0; i < order.size(); ++i)
+        {
+          description.coarse_cells[i] = coarse_cells[order[i]];
+          description.coarse_cell_index_to_coarse_cell_id[i] =
+            coarse_ids[order[i]];
+        }
+    }
     copy_tria.clear();
-    copy_tria.create_triangulation(
-      TriangulationDescription::Utilities::
-        create_description_from_triangulation(p4est_tria, copy_partition));
+    copy_tria.create_triangulation(description);
 
     // Every polytope, sent to the rank that holds it on the copy: its global
     // polytope index, its number of cells and the CellIds of its cells in
