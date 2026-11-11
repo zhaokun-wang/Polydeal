@@ -144,9 +144,15 @@ namespace dealii::PolytopeRepartition
      * rank @p destination[k], and polytope @p k of @p to_polytopes comes from
      * the rank @p source[k]. Between two ranks, both sides list the polytopes
      * they share in the order of their global polytope index and the cells
-     * of each in CellId order, so a message holds only, cell by cell, the
-     * length of its data and the data. @p to_data is indexed by the active
-     * cell index of the triangulation of @p to_polytopes.
+     * of each in CellId order, so no CellId is sent. The cells of a polytope
+     * often hold the same data, the polynomial of the polytope, so a message
+     * holds, polytope by polytope, every distinct data of its cells once,
+     * with its length, followed by the position of the data of every cell
+     * among them. The positions are left out when all cells hold the same
+     * data, or when every cell holds different data. If the positions would
+     * make the message longer than the data of every cell, the data of every
+     * cell is sent instead, as if all were different. @p to_data is indexed by
+     * the active cell index of the triangulation of @p to_polytopes.
      */
     void
     send_cell_data(const std::vector<std::vector<CellIterator>> &from_polytopes,
@@ -512,19 +518,59 @@ namespace dealii::PolytopeRepartition
     const std::vector<unsigned int>              &source,
     std::vector<std::vector<double>>             &to_data) const
   {
-    // One message per destination rank: for every cell of every polytope it
-    // receives, the length of the data of the cell and the data.
+    // One message per destination rank. For every polytope it receives: the
+    // number of distinct data of its cells, each of them with its length,
+    // and the position of the data of every cell among them. The positions
+    // are left out if there is one distinct data, which every cell then
+    // holds, or as many as cells, in which case cell i holds the i-th. A
+    // polytope of one cell has one data, and its number is left out too.
     std::map<unsigned int, std::vector<double>> data_to_send;
     for (unsigned int polytope = 0; polytope < from_polytopes.size();
          ++polytope)
       {
-        auto &message = data_to_send[destination[polytope]];
-        for (const auto &cell : from_polytopes[polytope])
+        const auto &cells = from_polytopes[polytope];
+        std::map<std::vector<double>, unsigned int> position_of_data;
+        std::vector<const std::vector<double> *> distinct_data;
+        std::vector<unsigned int>                position_of_cell(cells.size());
+        for (unsigned int i = 0; i < cells.size(); ++i)
           {
-            const auto &cell_data = from_data[cell->active_cell_index()];
-            message.push_back(cell_data.size());
-            message.insert(message.end(), cell_data.begin(), cell_data.end());
+            const auto &cell_data = from_data[cells[i]->active_cell_index()];
+            const auto [entry, is_new] =
+              position_of_data.emplace(cell_data, distinct_data.size());
+            if (is_new)
+              distinct_data.push_back(&cell_data);
+            position_of_cell[i] = entry->second;
           }
+
+        // If listing the distinct data and the positions takes more values
+        // than listing the data of every cell, every cell is listed instead,
+        // as if all were different.
+        std::size_t n_values_cells = 0, n_values_distinct = 0;
+        for (const auto &cell : cells)
+          n_values_cells += 1 + from_data[cell->active_cell_index()].size();
+        for (const auto *data : distinct_data)
+          n_values_distinct += 1 + data->size();
+        if (distinct_data.size() != 1 && distinct_data.size() != cells.size())
+          n_values_distinct += cells.size();
+        if (n_values_distinct > n_values_cells)
+          {
+            distinct_data.clear();
+            for (const auto &cell : cells)
+              distinct_data.push_back(&from_data[cell->active_cell_index()]);
+          }
+
+        auto &message = data_to_send[destination[polytope]];
+        if (cells.size() > 1)
+          message.push_back(distinct_data.size());
+        for (const auto *data : distinct_data)
+          {
+            message.push_back(data->size());
+            message.insert(message.end(), data->begin(), data->end());
+          }
+        if (distinct_data.size() != 1 && distinct_data.size() != cells.size())
+          message.insert(message.end(),
+                         position_of_cell.begin(),
+                         position_of_cell.end());
       }
     const auto data_received = Utilities::MPI::some_to_some(comm, data_to_send);
 
@@ -537,13 +583,33 @@ namespace dealii::PolytopeRepartition
       {
         const auto &message = data_received.at(source[polytope]);
         auto       &read    = position[source[polytope]];
-        for (const auto &cell : to_polytopes[polytope])
+        const auto &cells   = to_polytopes[polytope];
+
+        // The start and the length of every distinct data in the message.
+        const std::size_t n_distinct =
+          cells.size() > 1 ? static_cast<std::size_t>(message[read++]) : 1;
+        std::vector<std::pair<std::size_t, std::size_t>> distinct_data(
+          n_distinct);
+        for (auto &[start, length] : distinct_data)
           {
-            const std::size_t length = static_cast<std::size_t>(message[read]);
-            to_data[cell->active_cell_index()].assign(
-              message.begin() + read + 1, message.begin() + read + 1 + length);
+            length = static_cast<std::size_t>(message[read]);
+            start  = read + 1;
             read += 1 + length;
           }
+
+        const bool positions_sent =
+          n_distinct != 1 && n_distinct != cells.size();
+        for (std::size_t i = 0; i < cells.size(); ++i)
+          {
+            const std::size_t data_index =
+              positions_sent ? static_cast<std::size_t>(message[read + i]) :
+                               (n_distinct == 1 ? 0 : i);
+            const auto [start, length] = distinct_data[data_index];
+            to_data[cells[i]->active_cell_index()].assign(
+              message.begin() + start, message.begin() + start + length);
+          }
+        if (positions_sent)
+          read += cells.size();
       }
   }
 
