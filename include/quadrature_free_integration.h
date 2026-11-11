@@ -787,7 +787,9 @@ namespace dealii::QuadratureFree
             samples[q]       = fe.shape_value(i, point);
           }
         qr.least_squares(fitted, samples);
-        for (unsigned int power = 0; power <= degree; ++power)
+        // B_n has degree n: the fitted coefficients of higher powers are
+        // round-off, and are dropped so that the face terms can skip them.
+        for (unsigned int power = 0; power <= index_1d; ++power)
           basis.coefficients_1d[index_1d][power] = fitted[power];
       }
     for (unsigned int index_1d = 0; index_1d <= degree; ++index_1d)
@@ -1078,25 +1080,29 @@ namespace dealii::QuadratureFree
             const double shift       = (2. * (lo_u[direction] - lo_side) +
                                   length_u[direction] - length_side) /
                                  length_side;
+            // B_n has degree n and its derivative degree n - 1, so each is
+            // rewritten only up to its own degree. The higher coefficients
+            // stay zero.
             for (unsigned int index_1d = 0; index_1d <= degree; ++index_1d)
               {
                 const double *coefficients =
                   bases[side]->coefficients_1d[index_1d].data();
                 internal::substitute_affine(
                   coefficients,
-                  degree,
+                  index_1d,
                   scaling,
                   shift,
                   &value[slot(side, direction, index_1d)]);
+                if (index_1d == 0)
+                  continue;
                 // d/dx_d = (2 / length_side) d/dt_d.
                 double derivative[64];
-                for (unsigned int power = 0; power < degree; ++power)
+                for (unsigned int power = 0; power < index_1d; ++power)
                   derivative[power] =
                     (power + 1) * coefficients[power + 1] * 2. / length_side;
-                derivative[degree] = 0.;
                 internal::substitute_affine(
                   derivative,
-                  degree,
+                  index_1d - 1,
                   scaling,
                   shift,
                   &gradient[slot(side, direction, index_1d)]);
@@ -1169,8 +1175,10 @@ namespace dealii::QuadratureFree
                   double *product_gradient =
                     &products_gradient[(direction * n_pairs + pair) *
                                        product_length];
-                  for (unsigned int i = 0; i <= degree_a; ++i)
-                    for (unsigned int j = 0; j <= degree_b; ++j)
+                  // B_n has degree n, so only its first n + 1 coefficients
+                  // are non-zero.
+                  for (unsigned int i = 0; i <= index_a; ++i)
+                    for (unsigned int j = 0; j <= index_b; ++j)
                       {
                         product_value[i + j] += value_a[i] * value_b[j];
                         product_gradient[i + j] += gradient_a[i] * value_b[j];
@@ -1184,6 +1192,37 @@ namespace dealii::QuadratureFree
             return basis_a.exponents[i][direction] * (degree_b + 1) +
                    basis_b.exponents[j][direction];
           };
+          // The degree n + m of the product of the pair (n, m).
+          const auto pair_degree = [&](const unsigned int pair) {
+            return pair / (degree_b + 1) + pair % (degree_b + 1);
+          };
+          // remaining_degree[pair]: the largest sum of the exponents of an
+          // entry in the active directions after the first, over the entries
+          // whose pair in the first active direction is this one. The partial
+          // sums of the pair are needed only up to this total degree. For
+          // FE_AggloDGP it is 2p - n - m.
+          std::array<std::vector<int>, 2> largest_rest;
+          for (unsigned int side = 0; side < 2; ++side)
+            {
+              const auto &basis = (side == 0) ? basis_a : basis_b;
+              largest_rest[side].assign(basis.degree + 1, -1);
+              for (unsigned int i = 0; i < basis.n_dofs; ++i)
+                {
+                  int rest = 0;
+                  for (unsigned int k = 1; k < n_active; ++k)
+                    rest += basis.exponents[i][active[k]];
+                  int &largest =
+                    largest_rest[side][basis.exponents[i][active[0]]];
+                  largest = std::max(largest, rest);
+                }
+            }
+          thread_local std::vector<unsigned int> remaining_degree;
+          remaining_degree.assign(n_pairs, 0);
+          for (unsigned int n = 0; n <= degree_a; ++n)
+            for (unsigned int m = 0; m <= degree_b; ++m)
+              if (largest_rest[0][n] >= 0 && largest_rest[1][m] >= 0)
+                remaining_degree[n * (degree_b + 1) + m] =
+                  largest_rest[0][n] + largest_rest[1][m];
 
           // 5b. The contraction, term by term.
           entry_mass.assign(basis_a.n_dofs * basis_b.n_dofs, 0.);
@@ -1226,7 +1265,7 @@ namespace dealii::QuadratureFree
                       const double *coefficients = product(first_active, pair);
                       double        sum          = 0.;
                       for (unsigned int exponent_0 = 0;
-                           exponent_0 < product_length;
+                           exponent_0 <= pair_degree(pair);
                            ++exponent_0)
                         sum += coefficients[exponent_0] *
                                moment_table[exponent_0 * stride[first_active]];
@@ -1248,11 +1287,11 @@ namespace dealii::QuadratureFree
                       const double *coefficients = product(first_active, pair);
                       double *contracted = &partial[pair * product_length];
                       for (unsigned int exponent_0 = 0;
-                           exponent_0 < product_length;
+                           exponent_0 <= pair_degree(pair);
                            ++exponent_0)
                         if (coefficients[exponent_0] != 0.)
                           for (unsigned int exponent_1 = 0;
-                               exponent_1 < product_length &&
+                               exponent_1 <= remaining_degree[pair] &&
                                exponent_0 + exponent_1 <= max_product_degree;
                                ++exponent_1)
                             contracted[exponent_1] +=
@@ -1266,11 +1305,13 @@ namespace dealii::QuadratureFree
                         const double *contracted =
                           &partial[pair_of(i, j, first_active) *
                                    product_length];
+                        const unsigned int pair_1 =
+                          pair_of(i, j, second_active);
                         const double *coefficients =
-                          product(second_active, pair_of(i, j, second_active));
+                          product(second_active, pair_1);
                         double sum = 0.;
                         for (unsigned int exponent_1 = 0;
-                             exponent_1 < product_length;
+                             exponent_1 <= pair_degree(pair_1);
                              ++exponent_1)
                           sum +=
                             coefficients[exponent_1] * contracted[exponent_1];
@@ -1290,15 +1331,16 @@ namespace dealii::QuadratureFree
                       double       *contracted =
                         &partial[pair * product_length * product_length];
                       for (unsigned int exponent_0 = 0;
-                           exponent_0 < product_length;
+                           exponent_0 <= pair_degree(pair);
                            ++exponent_0)
                         if (coefficients[exponent_0] != 0.)
                           for (unsigned int exponent_1 = 0;
-                               exponent_1 < product_length &&
+                               exponent_1 <= remaining_degree[pair] &&
                                exponent_0 + exponent_1 <= max_product_degree;
                                ++exponent_1)
                             for (unsigned int exponent_2 = 0;
-                                 exponent_2 < product_length &&
+                                 exponent_1 + exponent_2 <=
+                                   remaining_degree[pair] &&
                                  exponent_0 + exponent_1 + exponent_2 <=
                                    max_product_degree;
                                  ++exponent_2)
@@ -1328,24 +1370,24 @@ namespace dealii::QuadratureFree
                             const double *contracted =
                               &partial[pair0 * product_length * product_length];
                             for (unsigned int exponent_1 = 0;
-                                 exponent_1 < product_length;
+                                 exponent_1 <= pair_degree(pair1) &&
+                                 exponent_1 <= remaining_degree[pair0];
                                  ++exponent_1)
                               if (coefficients[exponent_1] != 0.)
                                 for (unsigned int exponent_2 = 0;
-                                     exponent_2 + exponent_1 <=
-                                       max_product_degree &&
-                                     exponent_2 < product_length;
+                                     exponent_1 + exponent_2 <=
+                                     remaining_degree[pair0];
                                      ++exponent_2)
                                   contracted2[exponent_2] +=
                                     coefficients[exponent_1] *
                                     contracted[exponent_1 * product_length +
                                                exponent_2];
                           }
-                        const double *coefficients =
-                          product(2, pair_of(i, j, 2));
-                        double sum = 0.;
+                        const unsigned int pair2 = pair_of(i, j, 2);
+                        const double      *coefficients = product(2, pair2);
+                        double             sum          = 0.;
                         for (unsigned int exponent_2 = 0;
-                             exponent_2 < product_length;
+                             exponent_2 <= pair_degree(pair2);
                              ++exponent_2)
                           sum +=
                             coefficients[exponent_2] * contracted2[exponent_2];
