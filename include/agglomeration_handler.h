@@ -1010,7 +1010,9 @@ template <int dim, int spacedim>
 inline decltype(auto)
 AgglomerationHandler<dim, spacedim>::get_interface() const
 {
-  return polytope_cache.interface;
+  // Parenthesised so that decltype(auto) deduces a reference: without them
+  // every call copied the whole interface cache.
+  return (polytope_cache.interface);
 }
 
 
