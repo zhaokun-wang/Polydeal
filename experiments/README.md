@@ -56,9 +56,10 @@ used as installed.
 1. Put the repository on the cluster, for instance with
    `git clone -b thesis-experiments https://github.com/zhaokun-wang/Polydeal.git`;
    if the login nodes cannot reach GitHub, clone it elsewhere and copy it over.
-2. Edit the settings at the top of `experiments/slurm/common.sh`: the paths,
-   the output directory, the modules, and the installation directories of
-   deal.II and ParMETIS.
+2. Edit the settings at the top of `experiments/slurm/common.sh`: the modules
+   and the installation directories of deal.II and ParMETIS. The repository is
+   found from the location of `common.sh`; the build directories and the
+   output directory `runs/` lie inside it by default and can be moved there.
 3. Replace `CHANGE_ME` in the `#SBATCH --account` and `#SBATCH --qos` lines of
    the job scripts in `experiments/slurm/`.
 4. Build on a compute node, submitting from `experiments/slurm/` (the scripts
@@ -129,7 +130,8 @@ Intel Xeon E5-2683 v4 nodes. The longest single runs are the moving peak (about
 
 ## Output
 
-Please send back the whole output directory (`RUNS` in `slurm/common.sh`),
+Please send back the whole output directory (`RUNS` in `slurm/common.sh`,
+`runs/` in the repository by default),
 for instance as `tar czf runs.tar.gz -C $(dirname $RUNS) $(basename $RUNS)`,
 together with the Slurm log files `*_<jobid>.log` and the versions of the
 modules used. The lines that the analysis reads are, in each `log.txt`:

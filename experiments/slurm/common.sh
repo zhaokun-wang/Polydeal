@@ -1,12 +1,13 @@
 # Sourced by every job script. Edit the settings below for your installation;
 # nothing else in the job scripts needs to change.
 
-# This repository, its build directory, and the build directory of experiments/.
-ROOT=$HOME/Polydeal
+# This repository, found from the location of this file, the build directory of
+# polyDEAL and the build directory of experiments/.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD=$ROOT/build
 EXP=$ROOT/build-experiments
 # Where the runs write their output, one directory per run.
-RUNS=$HOME/polydeal_runs
+RUNS=$ROOT/runs
 # The modules (or environment) that provide MPI, deal.II, Trilinos, p4est and
 # ParMETIS, and the installation directories of deal.II and ParMETIS (only
 # build.sbatch uses these two).
