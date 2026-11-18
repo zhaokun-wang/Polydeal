@@ -17,14 +17,22 @@
 // with the exact solution u = sin(pi x) sin(pi y) r^(2/3), r the distance to
 // the centre of the square, which is in H^(5/3) but not in H^2.
 //
-// The initial mesh is a p4est triangulation before any refinement. Every rank
-// builds one R-tree over its initial cells, and every node of the tree is a
-// polytope. The current polytopes are refined down the tree and merged back
-// up it (PolytopeAdaptivity::AdaptivePolytopalMesh). Below a single initial
-// cell, p4est refines and coarsens the cell. The SIPG system is solved on
-// the current polytopes, and the residual error indicators of Cangiani, Dong
-// and Georgoulis mark them against a tolerance for the error estimator.
-// The loop stops once the error estimator is at or under the tolerance.
+// The initial mesh is a p4est triangulation before any refinement. METIS
+// assigns its cells to the ranks, every rank builds one R-tree over its
+// initial cells, and every node of the tree is a polytope. The current
+// polytopes are refined down the tree and merged back up it
+// (PolytopeAdaptivity::AdaptivePolytopalMesh). Below a single initial cell,
+// p4est refines and coarsens the cell. The SIPG system is solved on the
+// current polytopes, and the residual error indicators of Cangiani, Dong and
+// Georgoulis mark them against a tolerance for the error estimator. The loop
+// stops once the error estimator is at or under the tolerance.
+//
+// The ranks of METIS are not those of p4est, so a polytope may hold cells of
+// several ranks of the p4est triangulation. The system is therefore
+// assembled and solved, and the error is estimated, on a copy of the mesh on
+// which every polytope lies on the rank of its R-tree
+// (PolytopeRepartition::PartitionedCopy), and the error indicators are sent
+// back to the p4est cells for the next adaptation.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi.h>
@@ -49,6 +57,7 @@
 #include <fe_agglodgp.h>
 #include <poly_utils.h>
 #include <polytope_adaptivity.h>
+#include <polytope_repartition.h>
 
 #include <cmath>
 #include <cstdint>
@@ -331,8 +340,8 @@ private:
   ConditionalOStream pcout;
 
   /**
-   * The p4est triangulation. It is never repartitioned, so that every polytope
-   * stays on one rank.
+   * The p4est triangulation. It is never repartitioned, so that every cell
+   * keeps its rank, as AdaptivePolytopalMesh requires.
    */
   parallel::distributed::Triangulation<dim> tria;
 
@@ -348,8 +357,10 @@ private:
 
   /**
    * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
-   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
-   * $40/h$.
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square of side $s$ at
+   * $p = 4$ is $20\sqrt{2}/s$. On the polytopes that the R-trees in the rank
+   * regions of METIS form, this is about 1.5 times the smallest constant that
+   * keeps their diagonal blocks positive definite.
    */
   const double penalty_constant;
 
@@ -359,8 +370,14 @@ private:
   PolytopeAdaptivity::AdaptivePolytopalMesh<dim> polytopal_mesh;
 
   /**
-   * The cache of the triangulation and the AgglomerationHandler on the current
-   * polytopes, both rebuilt in every cycle.
+   * The copy of the mesh on which the system is assembled and solved, rebuilt
+   * in every cycle.
+   */
+  PolytopeRepartition::PartitionedCopy<dim> partitioned_copy;
+
+  /**
+   * The cache of the copy and the AgglomerationHandler on the polytopes of
+   * the copy, both rebuilt in every cycle.
    */
   std::unique_ptr<GridTools::Cache<dim>>     cached_tria;
   std::unique_ptr<AgglomerationHandler<dim>> ah;
@@ -380,22 +397,18 @@ private:
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
 
   /**
-   * The ratios of boundary measure to volume of the polytopes, for the
-   * penalty, see PolytopeAdaptivity::shape_ratios().
-   */
-  TrilinosWrappers::MPI::Vector ratios;
-
-  /**
    * The exact solution and the right-hand side $f = -\Delta u$.
    */
   SingularSolution<dim>      exact_solution;
   SingularRightHandSide<dim> rhs_function;
 
   /**
-   * The error indicators, stored on the active cells: each of the $n_P$
-   * cells of a polytope $P$ holds $\eta_P / \sqrt{n_P}$.
+   * The error indicators on the active cells of the p4est triangulation and
+   * of the copy: each of the $n_P$ cells of a polytope $P$ holds
+   * $\eta_P / \sqrt{n_P}$.
    */
   Vector<float> cell_indicators;
+  Vector<float> copy_indicators;
 
   /**
    * The error estimator.
@@ -435,6 +448,7 @@ AdaptivePoissonProblem<dim>::AdaptivePoissonProblem(
   , fe_dg(degree)
   , penalty_constant(std::sqrt(2.) / 3. * (degree + 1) * (degree + dim))
   , polytopal_mesh(tria, degree, parameters)
+  , partitioned_copy(tria)
   , error_estimator(0.)
   , l2_error(0.)
   , h1_error(0.)
@@ -457,17 +471,23 @@ void
 AdaptivePoissonProblem<dim>::setup_agglomerated_problem()
 {
   ah.reset();
-  cached_tria = std::make_unique<GridTools::Cache<dim>>(tria, mapping);
-  ah          = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
-  for (const auto &polytope : polytopal_mesh.get_polytopes())
+  cached_tria.reset();
+  partitioned_copy.reinit(polytopal_mesh.get_polytopes(),
+                          polytopal_mesh.get_polytope_indices(),
+                          polytopal_mesh.get_polytope_index_offsets(),
+                          fe_dg.n_dofs_per_cell(),
+                          polytopal_mesh.get_tree_ranks());
+  cached_tria = std::make_unique<GridTools::Cache<dim>>(
+    partitioned_copy.get_triangulation(), mapping);
+  ah = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
+  for (const auto &polytope : partitioned_copy.get_polytopes())
     ah->define_agglomerate(polytope);
-  const unsigned int n_q_points = 2 * fe_dg.degree + 1;
+  const unsigned int n_q_points = fe_dg.degree + 1;
   ah->initialize_fe_values(QGauss<dim>(n_q_points),
                            update_values | update_gradients |
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
-  ratios = PolytopeAdaptivity::shape_ratios(*ah);
 }
 
 
@@ -512,9 +532,6 @@ AdaptivePoissonProblem<dim>::assemble_system()
                            agglo_values.JxW(q);
           }
 
-      const double h = polytope->diameter();
-      const double ratio =
-        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
@@ -525,10 +542,8 @@ AdaptivePoissonProblem<dim>::assemble_system()
               // PolytopeAdaptivity::boundary_penalty().
               const auto  &fe_face = ah->reinit(polytope, f);
               const auto  &normals = fe_face.get_normal_vectors();
-              const double sigma =
-                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                          h,
-                                                          ratio);
+              const double sigma   = PolytopeAdaptivity::boundary_penalty<dim>(
+                penalty_constant, polytope->get_bounding_box());
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -552,23 +567,10 @@ AdaptivePoissonProblem<dim>::assemble_system()
             ah->reinit_interface(polytope, neighbor, f, neighbor_face);
           const auto &fe_faces0 = fe_faces.first;
           neighbor->get_dof_indices(neighbor_dof_indices);
-          // diameter() is not available for a polytope of another rank, its
-          // bounding-box diagonal is.
-          double h_neighbor;
-          if (neighbor->is_locally_owned())
-            h_neighbor = neighbor->diameter();
-          else
-            {
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              h_neighbor = (corners.second - corners.first).norm();
-            }
           const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
             penalty_constant,
-            h,
-            h_neighbor,
-            ratio,
-            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+            polytope->get_bounding_box(),
+            neighbor->get_bounding_box());
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
@@ -638,11 +640,9 @@ template <int dim>
 void
 AdaptivePoissonProblem<dim>::solve()
 {
-  // deal.II's AMG for an elliptic problem.
-  TrilinosWrappers::PreconditionAMG                 amg;
-  TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-  amg_data.elliptic = true;
-  amg.initialize(system_matrix, amg_data);
+  // Algebraic multigrid with one smoother block per polytope.
+  TrilinosWrappers::PreconditionAMG amg;
+  PolytopeAdaptivity::initialize_polytope_amg(amg, system_matrix, *ah);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        solver_control(10000, 1e-13, 1e-7);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(solver_control);
@@ -692,8 +692,8 @@ AdaptivePoissonProblem<dim>::estimate_and_compute_errors()
                                                   locally_relevant_solution,
                                                   rhs_function,
                                                   penalty_constant,
-                                                  ratios,
-                                                  cell_indicators);
+                                                  copy_indicators);
+  partitioned_copy.copy_to_p4est(copy_indicators, cell_indicators);
   double sum_sq = 0.;
   for (const auto &cell : tria.active_cell_iterators())
     if (cell->is_locally_owned())
@@ -737,8 +737,8 @@ AdaptivePoissonProblem<dim>::output_results(const unsigned int counter,
         const auto &cells        = polytope->get_agglomerate();
         double      indicator_sq = 0.;
         for (const auto &cell : cells)
-          indicator_sq += cell_indicators[cell->active_cell_index()] *
-                          cell_indicators[cell->active_cell_index()];
+          indicator_sq += copy_indicators[cell->active_cell_index()] *
+                          copy_indicators[cell->active_cell_index()];
         for (const auto &cell : cells)
           {
             const unsigned int index = cell->active_cell_index();
@@ -826,10 +826,11 @@ main(int argc, char *argv[])
   const MPI_Comm                   comm = MPI_COMM_WORLD;
 
   PolytopeAdaptivity::AdaptivityParameters parameters;
-  parameters.max_cells_per_polytope = 64;
-  parameters.level_rule = PolytopeAdaptivity::LevelRule::multiple_levels;
+  parameters.max_cells_per_polytope = 256;
+  parameters.level_rule        = PolytopeAdaptivity::LevelRule::multiple_levels;
+  parameters.initial_partition = PolytopeAdaptivity::InitialPartition::metis;
 
-  const unsigned int        n_subdivisions = 64;
+  const unsigned int        n_subdivisions = 256;
   const unsigned int        degree         = 4;
   const unsigned int        n_cycles       = 20;
   const double              tolerance      = 5e-5;

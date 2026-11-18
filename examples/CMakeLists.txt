@@ -12,7 +12,7 @@ file(GLOB APP_SOURCES ./*.cc )
 configure_file(adaptive_polytopal.prm
                ${CMAKE_CURRENT_BINARY_DIR}/adaptive_polytopal.prm COPYONLY)
 
-# ParMETIS, for the examples that partition the polytope graph
+# ParMETIS, for the examples that solve on a partitioned copy of the mesh
 # (include/polytope_repartition.h). Pass -DPARMETIS_DIR=/path/to/parmetis, or
 # leave it empty to search the system paths; without ParMETIS these examples
 # are skipped.
@@ -22,7 +22,8 @@ configure_file(adaptive_polytopal.prm
 # relocatable object that exports only the ParMETIS_* symbols, it is linked
 # instead of the libraries to avoid that. It is optional.
 set(PARMETIS_DIR "" CACHE PATH "Installation directory of ParMETIS")
-set(_parmetis_examples repartitioned_poisson adaptive_polytopal)
+set(_parmetis_examples adaptive_poisson repartitioned_poisson adaptive_heat
+    adaptive_polytopal)
 find_path(PARMETIS_INCLUDE_DIR parmetis.h HINTS ${PARMETIS_DIR}/include)
 find_file(PARMETIS_PRIVATE_OBJECT parmetis_private.o
           HINTS ${PARMETIS_DIR}/lib64 ${PARMETIS_DIR}/lib NO_DEFAULT_PATH)

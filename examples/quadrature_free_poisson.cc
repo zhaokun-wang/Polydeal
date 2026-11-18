@@ -14,15 +14,18 @@
 // Quadrature-free assembly of the SIPG discretization of
 //   -Delta u = f in Omega = (0,1)^2,
 //          u = 0 on the boundary,
-// with u = sin(pi x) sin(pi y), on polytopes of an R-tree agglomeration.
+// with the exact solution u = x(1 - x) y(1 - y)(1 + x + 2 y^2), so that f is a
+// polynomial of degree 4, on polytopes of an R-tree agglomeration. METIS
+// assigns the cells to the ranks, and every rank builds an R-tree over its
+// cells.
 //
 // For every degree the system is assembled twice, by quadrature over the
 // cells of every polytope and without quadrature
-// (QuadratureFree::PolytopeIntegrator): volume terms from the moments of the
-// polytopes, face terms from the moments of the interfaces. The load vector
-// is integrated by quadrature in both. The program prints the relative
-// difference of the two matrices, the assembly times, and the error of the
-// solution of the quadrature-free system.
+// (QuadratureFree::PolytopeIntegrator): volume terms and the load vector
+// int_P f phi_i from the moments of the polytopes, face terms from the
+// moments of the interfaces. The program prints the relative differences of
+// the two matrices, the two load vectors and the two solutions, the L2 errors
+// of the two solutions and the assembly times.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/function.h>
@@ -30,9 +33,10 @@
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/timer.h>
 
-#include <deal.II/distributed/tria.h>
+#include <deal.II/distributed/fully_distributed_tria.h>
 
 #include <deal.II/grid/grid_generator.h>
+#include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/grid_tools_cache.h>
 
 #include <deal.II/lac/solver_cg.h>
@@ -44,6 +48,7 @@
 
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/rtree.h>
+#include <deal.II/numerics/vector_tools.h>
 
 #include <agglomeration_handler.h>
 #include <agglomerator.h>
@@ -58,78 +63,6 @@
 #include <iomanip>
 
 using namespace dealii;
-
-
-
-/**
- * The exact solution $u = \sin(\pi x) \sin(\pi y)$.
- */
-template <int dim>
-class Solution : public Function<dim>
-{
-public:
-  virtual double
-  value(const Point<dim> &p, const unsigned int component = 0) const override;
-
-  virtual Tensor<1, dim>
-  gradient(const Point<dim>  &p,
-           const unsigned int component = 0) const override;
-};
-
-
-
-template <int dim>
-double
-Solution<dim>::value(const Point<dim> &p, const unsigned int) const
-{
-  double value = 1.;
-  for (unsigned int direction = 0; direction < dim; ++direction)
-    value *= std::sin(numbers::PI * p[direction]);
-  return value;
-}
-
-
-
-template <int dim>
-Tensor<1, dim>
-Solution<dim>::gradient(const Point<dim> &p, const unsigned int) const
-{
-  Tensor<1, dim> gradient;
-  for (unsigned int direction = 0; direction < dim; ++direction)
-    {
-      gradient[direction] = numbers::PI * std::cos(numbers::PI * p[direction]);
-      for (unsigned int other_direction = 0; other_direction < dim;
-           ++other_direction)
-        if (other_direction != direction)
-          gradient[direction] *= std::sin(numbers::PI * p[other_direction]);
-    }
-  return gradient;
-}
-
-
-
-/**
- * The right-hand side $f = -\Delta u = d \pi^2 u$.
- */
-template <int dim>
-class RightHandSide : public Function<dim>
-{
-public:
-  virtual double
-  value(const Point<dim> &p, const unsigned int component = 0) const override;
-
-private:
-  const Solution<dim> solution;
-};
-
-
-
-template <int dim>
-double
-RightHandSide<dim>::value(const Point<dim> &p, const unsigned int) const
-{
-  return dim * numbers::PI * numbers::PI * solution.value(p);
-}
 
 
 
@@ -264,12 +197,6 @@ private:
   solve(const TrilinosWrappers::SparseMatrix &matrix);
 
   /**
-   * The $L^2$ error of the solution against the exact solution.
-   */
-  double
-  compute_l2_error() const;
-
-  /**
    * Write the solution and the polytopes to quadrature_free_poisson_NNNN.pvtu,
    * one piece per rank, and add it at @p at_time to the series
    * quadrature_free_poisson.pvd. In ParaView, colour by polytope_colour to see
@@ -295,7 +222,10 @@ private:
    */
   ConditionalOStream pcout;
 
-  parallel::distributed::Triangulation<dim> tria;
+  /**
+   * The mesh, partitioned by METIS.
+   */
+  parallel::fullydistributed::Triangulation<dim> tria;
 
   /**
    * The mapping of the cells, for GridTools::Cache.
@@ -316,25 +246,18 @@ private:
   std::unique_ptr<AgglomerationHandler<dim>> ah;
 
   /**
-   * The sparsity pattern of the system, the load vector, which is integrated
-   * by quadrature in both assemblies, and the solution of the quadrature-free
-   * system.
+   * The sparsity pattern of the system, the load vector and the solution.
    */
   TrilinosWrappers::SparsityPattern sparsity;
   TrilinosWrappers::MPI::Vector     system_rhs;
   TrilinosWrappers::MPI::Vector     solution;
 
   /**
-   * The ratios of boundary measure to volume of the polytopes, for the
-   * penalty, see PolytopeAdaptivity::shape_ratios().
+   * The exact solution $u$ and the right-hand side $f = -\Delta u$, both
+   * polynomials.
    */
-  TrilinosWrappers::MPI::Vector ratios;
-
-  /**
-   * The exact solution and the right-hand side.
-   */
-  Solution<dim>      exact_solution;
-  RightHandSide<dim> rhs_function;
+  const QuadratureFree::PolynomialFunction<dim> exact_solution;
+  const QuadratureFree::PolynomialFunction<dim> right_hand_side;
 
   /**
    * The time and the name of every output so far, for the .pvd series.
@@ -354,6 +277,12 @@ QuadratureFreePoissonProblem<dim>::QuadratureFreePoissonProblem(
   , extraction_level(extraction_level)
   , pcout(std::cout, (Utilities::MPI::this_mpi_process(comm) == 0))
   , tria(comm)
+  // u = x(1 - x) y(1 - y)(1 + x + 2 y^2), as the terms a x^i y^j, and
+  // f = -Delta u.
+  , exact_solution({{1, 1}, {1, 2}, {1, 3}, {1, 4}, {2, 3}, {2, 4}, {3, 1}, {3, 2}},
+                   {1., -1., 2., -2., -2., 2., -1., 1.})
+  , right_hand_side({{0, 3}, {0, 4}, {1, 0}, {1, 1}, {1, 2}, {2, 1}, {2, 2}, {3, 0}},
+                    {4., -4., 2., -6., 18., 12., -24., -2.})
 {}
 
 
@@ -362,8 +291,17 @@ template <int dim>
 void
 QuadratureFreePoissonProblem<dim>::make_fine_grid()
 {
-  GridGenerator::hyper_cube(tria, 0., 1.);
-  tria.refine_global(n_global_refinements);
+  // The mesh is not adapted, so every rank builds it whole, METIS assigns
+  // its cells to the ranks, and each rank keeps its own.
+  Triangulation<dim> serial_tria;
+  GridGenerator::hyper_cube(serial_tria, 0., 1.);
+  serial_tria.refine_global(n_global_refinements);
+  GridTools::partition_triangulation(Utilities::MPI::n_mpi_processes(comm),
+                                     serial_tria,
+                                     SparsityTools::Partitioner::metis);
+  tria.create_triangulation(
+    TriangulationDescription::Utilities::create_description_from_triangulation(
+      serial_tria, comm));
 
   // The polytopes are those of one extraction level of an R-tree over the
   // locally owned cells, split into their connected components.
@@ -393,13 +331,12 @@ QuadratureFreePoissonProblem<dim>::setup_agglomerated_problem(
   ah          = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
   for (const auto &polytope : polytopes)
     ah->define_agglomerate(polytope);
-  const unsigned int n_q_points = 2 * fe_dg.degree + 1;
+  const unsigned int n_q_points = fe_dg.degree + 1;
   ah->initialize_fe_values(QGauss<dim>(n_q_points),
                            update_values | update_gradients |
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
-  ratios = PolytopeAdaptivity::shape_ratios(*ah);
   ah->create_agglomeration_sparsity_pattern(sparsity);
 }
 
@@ -418,8 +355,10 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
     std::sqrt(2.) / 3. * (fe_dg.degree + 1) * (fe_dg.degree + dim);
 
   std::vector<FullMatrix<double>> stiffness;
+  std::vector<Vector<double>>     load;
   if (integrator != nullptr)
-    integrator->volume_matrices(*ah, stiffness);
+    integrator->volume_matrices(
+      *ah, stiffness, nullptr, &right_hand_side, &load);
 
   const unsigned int n_dofs = fe_dg.n_dofs_per_cell();
   FullMatrix<double> cell_matrix(n_dofs, n_dofs);
@@ -429,34 +368,37 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
   FullMatrix<double>                   face_mass, face_flux;
   std::vector<types::global_dof_index> local_dof_indices(n_dofs);
   std::vector<types::global_dof_index> neighbor_dof_indices(n_dofs);
-  std::vector<double>                  rhs_values, weights;
+  std::vector<double>                  weights, rhs_values;
 
   for (const auto &polytope : ah->polytope_iterators())
     {
       if (!polytope->is_locally_owned())
         continue;
-      cell_matrix              = 0.;
-      cell_rhs                 = 0.;
-      const auto &agglo_values = ah->reinit(polytope);
-      rhs_values.resize(agglo_values.n_quadrature_points);
-      rhs_function.value_list(agglo_values.get_quadrature_points(), rhs_values);
-      for (const unsigned int q : agglo_values.quadrature_point_indices())
-        for (unsigned int i = 0; i < n_dofs; ++i)
-          {
-            if (integrator == nullptr)
-              for (unsigned int j = 0; j < n_dofs; ++j)
-                cell_matrix(i, j) += agglo_values.shape_grad(i, q) *
-                                     agglo_values.shape_grad(j, q) *
-                                     agglo_values.JxW(q);
-            cell_rhs(i) += agglo_values.shape_value(i, q) * rhs_values[q] *
-                           agglo_values.JxW(q);
-          }
       if (integrator != nullptr)
-        cell_matrix = stiffness[polytope->index()];
+        {
+          cell_matrix = stiffness[polytope->index()];
+          cell_rhs    = load[polytope->index()];
+        }
+      else
+        {
+          cell_matrix              = 0.;
+          cell_rhs                 = 0.;
+          const auto &agglo_values = ah->reinit(polytope);
+          rhs_values.resize(agglo_values.n_quadrature_points);
+          right_hand_side.value_list(agglo_values.get_quadrature_points(),
+                                     rhs_values);
+          for (const unsigned int q : agglo_values.quadrature_point_indices())
+            for (unsigned int i = 0; i < n_dofs; ++i)
+              {
+                for (unsigned int j = 0; j < n_dofs; ++j)
+                  cell_matrix(i, j) += agglo_values.shape_grad(i, q) *
+                                       agglo_values.shape_grad(j, q) *
+                                       agglo_values.JxW(q);
+                cell_rhs(i) += agglo_values.shape_value(i, q) * rhs_values[q] *
+                               agglo_values.JxW(q);
+              }
+        }
 
-      const double h = polytope->diameter();
-      const double ratio =
-        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
@@ -470,9 +412,8 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
                   integrator->face_matrices(
                     *ah, polytope, f, face_mass, face_flux);
                   const double sigma =
-                    PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                              h,
-                                                              ratio);
+                    PolytopeAdaptivity::boundary_penalty<dim>(
+                      penalty_constant, polytope->get_bounding_box());
                   for (unsigned int i = 0; i < n_dofs; ++i)
                     for (unsigned int j = 0; j < n_dofs; ++j)
                       cell_matrix(i, j) += -face_flux(i, j) - face_flux(j, i) +
@@ -481,10 +422,8 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
                 }
               const auto  &fe_face = ah->reinit(polytope, f);
               const auto  &normals = fe_face.get_normal_vectors();
-              const double sigma =
-                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                          h,
-                                                          ratio);
+              const double sigma   = PolytopeAdaptivity::boundary_penalty<dim>(
+                penalty_constant, polytope->get_bounding_box());
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -505,21 +444,10 @@ QuadratureFreePoissonProblem<dim>::assemble_system(
           const unsigned int neighbor_face =
             polytope->neighbor_of_agglomerated_neighbor(f);
           neighbor->get_dof_indices(neighbor_dof_indices);
-          double h_neighbor;
-          if (neighbor->is_locally_owned())
-            h_neighbor = neighbor->diameter();
-          else
-            {
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              h_neighbor = (corners.second - corners.first).norm();
-            }
           const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
             penalty_constant,
-            h,
-            h_neighbor,
-            ratio,
-            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+            polytope->get_bounding_box(),
+            neighbor->get_bounding_box());
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
@@ -600,39 +528,13 @@ void
 QuadratureFreePoissonProblem<dim>::solve(
   const TrilinosWrappers::SparseMatrix &matrix)
 {
-  TrilinosWrappers::PreconditionAMG                 amg;
-  TrilinosWrappers::PreconditionAMG::AdditionalData data;
-  data.elliptic = true;
-  amg.initialize(matrix, data);
+  // Algebraic multigrid with one smoother block per polytope.
+  TrilinosWrappers::PreconditionAMG amg;
+  PolytopeAdaptivity::initialize_polytope_amg(amg, matrix, *ah);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        control(10000, 1e-14, 1e-10);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(control);
   solver.solve(matrix, solution, system_rhs, amg);
-}
-
-
-
-template <int dim>
-double
-QuadratureFreePoissonProblem<dim>::compute_l2_error() const
-{
-  std::vector<double> u_values;
-  double              error_sq = 0.;
-  for (const auto &polytope : ah->polytope_iterators())
-    {
-      if (!polytope->is_locally_owned())
-        continue;
-      const auto &fe_values = ah->reinit(polytope);
-      const auto &points    = fe_values.get_quadrature_points();
-      u_values.resize(points.size());
-      fe_values.get_function_values(solution, u_values);
-      for (const unsigned int q : fe_values.quadrature_point_indices())
-        {
-          const double error = u_values[q] - exact_solution.value(points[q]);
-          error_sq += error * error * fe_values.JxW(q);
-        }
-    }
-  return std::sqrt(Utilities::MPI::sum(error_sq, comm));
 }
 
 
@@ -715,8 +617,8 @@ QuadratureFreePoissonProblem<dim>::run(const std::vector<unsigned int> &degrees)
   pcout << "Running with " << Utilities::MPI::n_mpi_processes(comm)
         << " MPI ranks, " << Utilities::MPI::sum(polytopes.size(), comm)
         << " polytopes." << std::endl;
-  pcout << "degree    dofs   |A_qf - A|/|A|  quadrature [s]  "
-           "quadrature-free [s]  L2 error"
+  pcout << "degree    dofs   |A_qf - A|/|A|  |b_qf - b|/|b|  |u_qf - u|/|u|  "
+           "L2 error        L2 error (qf)   quadrature [s]  quadrature-free [s]"
         << std::endl;
   for (const unsigned int degree : degrees)
     {
@@ -730,6 +632,9 @@ QuadratureFreePoissonProblem<dim>::run(const std::vector<unsigned int> &degrees)
       timer.stop();
       const double time_quadrature =
         Utilities::MPI::max(timer.wall_time(), comm);
+      solve(matrix_quadrature);
+      const TrilinosWrappers::MPI::Vector rhs_quadrature      = system_rhs;
+      const TrilinosWrappers::MPI::Vector solution_quadrature = solution;
 
       // The expansions of the products of the basis functions depend only on
       // the element, and are computed once per degree, outside the timing.
@@ -741,15 +646,40 @@ QuadratureFreePoissonProblem<dim>::run(const std::vector<unsigned int> &degrees)
         Utilities::MPI::max(timer.wall_time(), comm);
 
       solve(matrix_quadrature_free);
-      const double l2_error = compute_l2_error();
 
+      // The differences, relative to the assembly by quadrature. Both
+      // solutions have the same basis, so their coefficients are compared.
       const double norm = matrix_quadrature.frobenius_norm();
       matrix_quadrature.add(-1., matrix_quadrature_free);
+      const double matrix_difference =
+        matrix_quadrature.frobenius_norm() / norm;
+      TrilinosWrappers::MPI::Vector difference = system_rhs;
+      difference.add(-1., rhs_quadrature);
+      const double rhs_difference =
+        difference.l2_norm() / rhs_quadrature.l2_norm();
+      difference = solution;
+      difference.add(-1., solution_quadrature);
+      const double solution_difference =
+        difference.l2_norm() / solution_quadrature.l2_norm();
+
+      // The L2 errors of the two solutions against the exact solution.
+      std::vector<double> errors_quadrature, errors_quadrature_free;
+      PolyUtils::compute_global_error(*ah,
+                                      solution_quadrature,
+                                      exact_solution,
+                                      {VectorTools::L2_norm},
+                                      errors_quadrature);
+      PolyUtils::compute_global_error(*ah,
+                                      solution,
+                                      exact_solution,
+                                      {VectorTools::L2_norm},
+                                      errors_quadrature_free);
       pcout << std::setw(6) << degree << std::setw(8) << ah->n_dofs() << "   "
-            << std::left << std::setw(15)
-            << matrix_quadrature.frobenius_norm() / norm << std::setw(16)
-            << time_quadrature << std::setw(21) << time_quadrature_free
-            << l2_error << std::right << std::endl;
+            << std::left << std::setw(16) << matrix_difference << std::setw(16)
+            << rhs_difference << std::setw(16) << solution_difference
+            << std::setw(16) << errors_quadrature[0] << std::setw(16)
+            << errors_quadrature_free[0] << std::setw(16) << time_quadrature
+            << time_quadrature_free << std::right << std::endl;
       // Uncomment to write the solution and the polytopes for ParaView.
       // output_results(degree, degree);
     }
@@ -761,8 +691,8 @@ int
 main(int argc, char *argv[])
 {
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
-  const unsigned int               n_global_refinements = 6;
-  const unsigned int               extraction_level     = 3;
+  const unsigned int               n_global_refinements = 8;
+  const unsigned int               extraction_level     = 4;
   QuadratureFreePoissonProblem<2>  problem(n_global_refinements,
                                           extraction_level,
                                           MPI_COMM_WORLD);

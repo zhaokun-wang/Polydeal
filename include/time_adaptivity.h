@@ -227,7 +227,7 @@ namespace dealii::TimeAdaptivity
 
       // The mass matrix and the right-hand side of the projection,
       // integrated child by child with the polynomial of each child.
-      const QGauss<dim>     quadrature(2 * degree + 1);
+      const QGauss<dim>     quadrature(degree + 1);
       const MappingQ1<dim>  mapping;
       const FE_Nothing<dim> fe_nothing;
       FEValues<dim>         fe_values(mapping,
@@ -508,13 +508,8 @@ namespace dealii::TimeAdaptivity
    * written as CellPolynomial data into @p cell_data. Without
    * @p old_solution, or with $\Delta t = 0$, it is the projection of $f$.
    *
-   * The mass matrix of a polytope that fills little of its bounding box is
-   * badly conditioned at higher degree; it is inverted through its singular
-   * value decomposition, dropping singular values below $10^{-12}$ of the
-   * largest.
-   *
    * The handler's FEValues are initialized here with values, on quadratures
-   * of $2p+2$ points per direction.
+   * of $p+1$ points per direction.
    */
   template <int dim>
   void
@@ -527,7 +522,7 @@ namespace dealii::TimeAdaptivity
     std::vector<std::vector<double>>       &cell_data)
   {
     const unsigned int n_dofs = ah.get_fe().dofs_per_cell;
-    const unsigned int n_q_1d = 2 * ah.get_fe().degree + 2;
+    const unsigned int n_q_1d = ah.get_fe().degree + 1;
     ah.initialize_fe_values(QGauss<dim>(n_q_1d),
                             update_values | update_quadrature_points |
                               update_JxW_values,
@@ -583,25 +578,13 @@ namespace dealii::TimeAdaptivity
         AssertDimension(q, points.size());
 
         // The coefficients of $A u_h$: the inverse of the mass matrix applied
-        // to the right-hand side, through its singular value decomposition
-        // $M = U \Sigma U^T$, with the small singular values dropped.
-        LAPACKFullMatrix<double> mass_svd(n_dofs, n_dofs);
-        mass_svd = mass;
-        mass_svd.compute_svd();
-        const auto         &u       = mass_svd.get_svd_u();
-        const double        largest = mass_svd.singular_value(0);
-        std::vector<double> operator_coefficients(n_dofs, 0.);
-        for (unsigned int k = 0; k < n_dofs; ++k)
-          {
-            const double sigma = mass_svd.singular_value(k);
-            if (sigma <= 1e-12 * largest)
-              break;
-            double component = 0.;
-            for (unsigned int i = 0; i < n_dofs; ++i)
-              component += u(i, k) * rhs(i);
-            for (unsigned int i = 0; i < n_dofs; ++i)
-              operator_coefficients[i] += u(i, k) * component / sigma;
-          }
+        // to the right-hand side, by a Cholesky factorization.
+        LAPACKFullMatrix<double> mass_cholesky(n_dofs, n_dofs);
+        mass_cholesky = mass;
+        mass_cholesky.set_property(LAPACKSupport::symmetric);
+        mass_cholesky.compute_cholesky_factorization();
+        mass_cholesky.solve(rhs);
+        const std::vector<double> operator_coefficients(rhs.begin(), rhs.end());
         const auto data =
           CellPolynomial::pack<dim>(ah.get_local_bboxes()[polytope->index()],
                                     operator_coefficients);
@@ -624,12 +607,12 @@ namespace dealii::TimeAdaptivity
    * the new time, $A^{n+1}$ and $A^n$ the discrete elliptic operators of the
    * new and the old solution (compute_discrete_operator()) on the cells of
    * @p ah, and $T$ the final time @p final_time. The integral in time is by
-   * three-point Gauss, in space by $2p+2$ points per direction on the cells.
+   * three-point Gauss, in space by $p+1$ points per direction on the cells.
    * @p rhs_function is evaluated at the times of the rule and left at the new
    * time.
    *
    * The handler's FEValues are initialized here with values, on quadratures
-   * of $2p+2$ points per direction.
+   * of $p+1$ points per direction.
    */
   template <int dim>
   double
@@ -641,7 +624,7 @@ namespace dealii::TimeAdaptivity
                          const std::vector<std::vector<double>> &operator_old,
                          const double                            final_time)
   {
-    const unsigned int n_q_1d = 2 * ah.get_fe().degree + 2;
+    const unsigned int n_q_1d = ah.get_fe().degree + 1;
     ah.initialize_fe_values(QGauss<dim>(n_q_1d),
                             update_values | update_quadrature_points |
                               update_JxW_values,

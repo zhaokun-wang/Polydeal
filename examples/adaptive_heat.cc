@@ -26,6 +26,15 @@
 // tolerance. The solution of the last step and its discrete elliptic operator
 // are carried through every change of the mesh
 // (TimeAdaptivity::CellPolynomialTransfer).
+//
+// METIS assigns the initial cells to the ranks, and every rank builds an
+// R-tree over its initial cells. The ranks of METIS are not those of p4est,
+// so a polytope may hold cells of several ranks of the p4est triangulation.
+// The system is therefore assembled and solved, and the error is estimated,
+// on a copy of the mesh on which every polytope lies on the rank of its
+// R-tree (PolytopeRepartition::PartitionedCopy). The old solution and its
+// operator go to the copy, and the error indicators, the new solution and its
+// operator come back to the p4est cells, where the mesh is adapted.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/function.h>
@@ -50,6 +59,7 @@
 #include <fe_agglodgp.h>
 #include <poly_utils.h>
 #include <polytope_adaptivity.h>
+#include <polytope_repartition.h>
 #include <time_adaptivity.h>
 
 #include <cmath>
@@ -382,9 +392,9 @@ private:
   ConditionalOStream pcout;
 
   /**
-   * The p4est triangulation. It is never repartitioned, so that every polytope
-   * stays on one rank, and CellPolynomialTransfer finds the data of every cell
-   * on its rank.
+   * The p4est triangulation. It is never repartitioned, so that every cell
+   * keeps its rank, as AdaptivePolytopalMesh requires, and
+   * CellPolynomialTransfer finds the data of every cell on its rank.
    */
   parallel::distributed::Triangulation<dim> tria;
 
@@ -400,8 +410,10 @@ private:
 
   /**
    * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
-   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
-   * $40/h$.
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square of side $s$ at
+   * $p = 4$ is $20\sqrt{2}/s$. On the polytopes that the R-trees in the rank
+   * regions of METIS form, this is about 1.5 times the smallest constant that
+   * keeps their diagonal blocks positive definite.
    */
   const double penalty_constant;
 
@@ -422,8 +434,14 @@ private:
   TimeAdaptivity::CellPolynomialTransfer<dim> polynomial_transfer;
 
   /**
-   * The cache of the triangulation and the AgglomerationHandler on the current
-   * polytopes, both rebuilt for every solution.
+   * The copy of the mesh on which the system is assembled and solved, rebuilt
+   * for every solution.
+   */
+  PolytopeRepartition::PartitionedCopy<dim> partitioned_copy;
+
+  /**
+   * The cache of the copy and the AgglomerationHandler on the polytopes of
+   * the copy, both rebuilt for every solution.
    */
   std::unique_ptr<GridTools::Cache<dim>>     cached_tria;
   std::unique_ptr<AgglomerationHandler<dim>> ah;
@@ -443,12 +461,6 @@ private:
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
 
   /**
-   * The ratios of boundary measure to volume of the polytopes, for the
-   * penalty, see PolytopeAdaptivity::shape_ratios().
-   */
-  TrilinosWrappers::MPI::Vector ratios;
-
-  /**
    * The source $f = u_t - \Delta u$ of the time steps, and $-\Delta u(0)$
    * of the initial value.
    */
@@ -457,22 +469,27 @@ private:
 
   /**
    * The solution of the last accepted step and its discrete elliptic
-   * operator, as CellPolynomial data on the active cells.
+   * operator, as CellPolynomial data on the active cells of the p4est
+   * triangulation and of the copy.
    */
   std::vector<std::vector<double>> old_solution;
   std::vector<std::vector<double>> old_operator;
+  std::vector<std::vector<double>> copy_old_solution;
+  std::vector<std::vector<double>> copy_old_operator;
 
   /**
-   * The same for the most recent solution.
+   * The same for the most recent solution, on the p4est triangulation.
    */
   std::vector<std::vector<double>> new_solution;
   std::vector<std::vector<double>> new_operator;
 
   /**
-   * The error indicators, stored on the active cells: each of the $n_P$
-   * cells of a polytope $P$ holds $\eta_P / \sqrt{n_P}$.
+   * The error indicators on the active cells of the p4est triangulation and
+   * of the copy: each of the $n_P$ cells of a polytope $P$ holds
+   * $\eta_P / \sqrt{n_P}$.
    */
   Vector<float> cell_indicators;
+  Vector<float> copy_indicators;
 
   /**
    * The error estimator, the largest error indicator of a polytope, and the
@@ -525,6 +542,7 @@ AdaptiveHeatProblem<dim>::AdaptiveHeatProblem(
   , polytopal_mesh(tria, degree, parameters)
   , step_parameters(step_parameters)
   , polynomial_transfer(tria)
+  , partitioned_copy(tria)
   , source(false)
   , initial_source(true)
   , error_estimator(0.)
@@ -551,17 +569,29 @@ void
 AdaptiveHeatProblem<dim>::setup_agglomerated_problem()
 {
   ah.reset();
-  cached_tria = std::make_unique<GridTools::Cache<dim>>(tria, mapping);
-  ah          = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
-  for (const auto &polytope : polytopal_mesh.get_polytopes())
+  cached_tria.reset();
+  partitioned_copy.reinit(polytopal_mesh.get_polytopes(),
+                          polytopal_mesh.get_polytope_indices(),
+                          polytopal_mesh.get_polytope_index_offsets(),
+                          fe_dg.n_dofs_per_cell(),
+                          polytopal_mesh.get_tree_ranks());
+  cached_tria = std::make_unique<GridTools::Cache<dim>>(
+    partitioned_copy.get_triangulation(), mapping);
+  ah = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
+  for (const auto &polytope : partitioned_copy.get_polytopes())
     ah->define_agglomerate(polytope);
-  const unsigned int n_q_points = 2 * fe_dg.degree + 1;
+  const unsigned int n_q_points = fe_dg.degree + 1;
   ah->initialize_fe_values(QGauss<dim>(n_q_points),
                            update_values | update_gradients |
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
-  ratios = PolytopeAdaptivity::shape_ratios(*ah);
+
+  // Before the initial value there is no old solution yet.
+  old_solution.resize(tria.n_active_cells());
+  old_operator.resize(tria.n_active_cells());
+  partitioned_copy.p4est_to_copy(old_solution, copy_old_solution);
+  partitioned_copy.p4est_to_copy(old_operator, copy_old_operator);
 }
 
 
@@ -620,7 +650,7 @@ AdaptiveHeatProblem<dim>::assemble_system(const double dt)
         {
           const double old_value =
             time_step ? TimeAdaptivity::CellPolynomial::evaluate<dim>(
-                          old_solution[cell_of_point[q]], points[q]) :
+                          copy_old_solution[cell_of_point[q]], points[q]) :
                         0.;
           for (unsigned int i = 0; i < n_dofs; ++i)
             {
@@ -640,9 +670,6 @@ AdaptiveHeatProblem<dim>::assemble_system(const double dt)
             }
         }
 
-      const double h = polytope->diameter();
-      const double ratio =
-        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
@@ -653,10 +680,8 @@ AdaptiveHeatProblem<dim>::assemble_system(const double dt)
               // PolytopeAdaptivity::boundary_penalty().
               const auto  &fe_face = ah->reinit(polytope, f);
               const auto  &normals = fe_face.get_normal_vectors();
-              const double sigma =
-                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                          h,
-                                                          ratio);
+              const double sigma   = PolytopeAdaptivity::boundary_penalty<dim>(
+                penalty_constant, polytope->get_bounding_box());
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -681,23 +706,10 @@ AdaptiveHeatProblem<dim>::assemble_system(const double dt)
             ah->reinit_interface(polytope, neighbor, f, neighbor_face);
           const auto &fe_faces0 = fe_faces.first;
           neighbor->get_dof_indices(neighbor_dof_indices);
-          // diameter() is not available for a polytope of another rank, its
-          // bounding-box diagonal is.
-          double h_neighbor;
-          if (neighbor->is_locally_owned())
-            h_neighbor = neighbor->diameter();
-          else
-            {
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              h_neighbor = (corners.second - corners.first).norm();
-            }
           const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
             penalty_constant,
-            h,
-            h_neighbor,
-            ratio,
-            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+            polytope->get_bounding_box(),
+            neighbor->get_bounding_box());
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
@@ -768,11 +780,9 @@ template <int dim>
 void
 AdaptiveHeatProblem<dim>::solve()
 {
-  // deal.II's AMG for an elliptic problem.
-  TrilinosWrappers::PreconditionAMG                 amg;
-  TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-  amg_data.elliptic = true;
-  amg.initialize(system_matrix, amg_data);
+  // Algebraic multigrid with one smoother block per polytope.
+  TrilinosWrappers::PreconditionAMG amg;
+  PolytopeAdaptivity::initialize_polytope_amg(amg, system_matrix, *ah);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        solver_control(10000, 1e-13, 1e-7);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(solver_control);
@@ -801,7 +811,7 @@ AdaptiveHeatProblem<dim>::estimate(const double dt)
           const Point<dim>                                        &point,
           const double                                             u_h) {
         return -(u_h - TimeAdaptivity::CellPolynomial::evaluate<dim>(
-                         old_solution[cell->active_cell_index()], point)) /
+                         copy_old_solution[cell->active_cell_index()], point)) /
                dt;
       };
   PolytopeAdaptivity::compute_residual_indicators(
@@ -810,37 +820,41 @@ AdaptiveHeatProblem<dim>::estimate(const double dt)
     time_step ? static_cast<const Function<dim> &>(source) :
                 static_cast<const Function<dim> &>(initial_source),
     penalty_constant,
-    ratios,
-    cell_indicators,
+    copy_indicators,
     time_step ? time_derivative : decltype(time_derivative)());
 
   double sum_sq = 0., largest = 0.;
-  for (const auto &polytope : polytopal_mesh.get_polytopes())
-    {
-      double polytope_sq = 0.;
-      for (const auto &cell : polytope)
-        polytope_sq += cell_indicators[cell->active_cell_index()] *
-                       cell_indicators[cell->active_cell_index()];
-      sum_sq += polytope_sq;
-      largest = std::max(largest, std::sqrt(polytope_sq));
-    }
+  for (const auto &polytope : ah->polytope_iterators())
+    if (polytope->is_locally_owned())
+      {
+        double polytope_sq = 0.;
+        for (const auto &cell : polytope->get_agglomerate())
+          polytope_sq += copy_indicators[cell->active_cell_index()] *
+                         copy_indicators[cell->active_cell_index()];
+        sum_sq += polytope_sq;
+        largest = std::max(largest, std::sqrt(polytope_sq));
+      }
   error_estimator        = std::sqrt(Utilities::MPI::sum(sum_sq, comm));
   max_polytope_indicator = Utilities::MPI::max(largest, comm);
+  partitioned_copy.copy_to_p4est(copy_indicators, cell_indicators);
 
-  TimeAdaptivity::polytope_polynomials(*ah, solution, new_solution);
+  std::vector<std::vector<double>> copy_solution, copy_operator;
+  TimeAdaptivity::polytope_polynomials(*ah, solution, copy_solution);
   TimeAdaptivity::compute_discrete_operator(
     *ah,
     solution,
     time_step ? static_cast<const Function<dim> &>(source) :
                 static_cast<const Function<dim> &>(initial_source),
-    time_step ? &old_solution : nullptr,
+    time_step ? &copy_old_solution : nullptr,
     dt,
-    new_operator);
+    copy_operator);
   time_indicator =
     time_step ?
       TimeAdaptivity::compute_time_indicator(
-        *ah, source, time, dt, new_operator, old_operator, final_time) :
+        *ah, source, time, dt, copy_operator, copy_old_operator, final_time) :
       0.;
+  partitioned_copy.copy_to_p4est(copy_solution, new_solution);
+  partitioned_copy.copy_to_p4est(copy_operator, new_operator);
 }
 
 
@@ -944,8 +958,8 @@ AdaptiveHeatProblem<dim>::output_results(const unsigned int counter,
         const auto &cells        = polytope->get_agglomerate();
         double      indicator_sq = 0.;
         for (const auto &cell : cells)
-          indicator_sq += cell_indicators[cell->active_cell_index()] *
-                          cell_indicators[cell->active_cell_index()];
+          indicator_sq += copy_indicators[cell->active_cell_index()] *
+                          copy_indicators[cell->active_cell_index()];
         for (const auto &cell : cells)
           {
             const unsigned int index = cell->active_cell_index();
@@ -1073,6 +1087,8 @@ main(int argc, char *argv[])
   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
 
   PolytopeAdaptivity::AdaptivityParameters parameters;
+  parameters.max_cells_per_polytope = 4096;
+  parameters.initial_partition = PolytopeAdaptivity::InitialPartition::metis;
 
   TimeAdaptivity::StepControlParameters step_parameters;
   step_parameters.initial_dt     = 0.02;
@@ -1080,11 +1096,11 @@ main(int argc, char *argv[])
   step_parameters.min_dt         = 0.02 / 1024.;
   step_parameters.time_tolerance = 0.65;
 
-  const unsigned int     n_subdivisions        = 64;
+  const unsigned int     n_subdivisions        = 256;
   const unsigned int     degree                = 4;
   const unsigned int     n_initial_adaptations = 5;
-  const double           final_time            = 0.2;
-  const double           tolerance             = 2.5e-3;
+  const double           final_time            = 0.6;
+  const double           tolerance             = 2.5e-4;
   AdaptiveHeatProblem<2> problem(n_subdivisions,
                                  degree,
                                  n_initial_adaptations,

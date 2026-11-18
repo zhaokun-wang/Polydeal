@@ -14,19 +14,22 @@
 // The adaptive Poisson problem of adaptive_poisson.cc, with the singular point
 // moved to (1/4, 1/4), solved on a copy of the mesh partitioned by polytopes.
 //
-// The p4est triangulation is never repartitioned, so that every polytope stays
-// on one rank, and refinement towards the singular point piles up the degrees
-// of freedom on the rank that owns it. The singular point is off the centre of
-// the square: at the centre, the space-filling curve of p4est splits the
-// refined region evenly between 2 or 4 ranks, and nothing piles up.
+// METIS assigns the initial cells to the ranks, and every rank builds an
+// R-tree over its initial cells, as in adaptive_poisson.cc. The polytopes of
+// a tree stay on its rank, so refinement towards the singular point piles up
+// the degrees of freedom on the rank whose initial cells hold it. The
+// singular point is off the centre of the square, where the initial cells of
+// several ranks meet and the refined region would be split between them.
 //
 // Every cycle the mesh is copied into a
 // parallel::fullydistributed::Triangulation partitioned by ParMETIS on the
 // graph of the polytopes (PolytopeRepartition::PartitionedCopy). The system is
 // assembled and solved and the error is estimated there, and the error
 // indicators are sent back to the p4est cells for the next adaptation. The
-// program prints the largest over mean number of degrees of freedom per rank
-// on both meshes.
+// program prints the largest over mean number of degrees of freedom per rank,
+// had every polytope stayed on the rank of its R-tree, and on the copy. With
+// use_parmetis = false in main(), the copy keeps the ranks of the R-trees, as
+// adaptive_poisson.cc does, and the two are equal.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi.h>
@@ -53,6 +56,7 @@
 #include <polytope_adaptivity.h>
 #include <polytope_repartition.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -262,6 +266,7 @@ public:
     const unsigned int                              n_cycles,
     const double                                    tolerance,
     const PolytopeAdaptivity::AdaptivityParameters &parameters,
+    const bool                                      use_parmetis,
     const MPI_Comm                                  comm);
 
   void
@@ -334,8 +339,8 @@ private:
   ConditionalOStream pcout;
 
   /**
-   * The p4est triangulation. It is never repartitioned, so that every polytope
-   * stays on one rank.
+   * The p4est triangulation. It is never repartitioned, so that every cell
+   * keeps its rank, as AdaptivePolytopalMesh requires.
    */
   parallel::distributed::Triangulation<dim> tria;
 
@@ -351,8 +356,10 @@ private:
 
   /**
    * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
-   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
-   * $40/h$.
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square of side $s$ at
+   * $p = 4$ is $20\sqrt{2}/s$. On the polytopes that the R-trees in the rank
+   * regions of METIS form, this is about 1.5 times the smallest constant that
+   * keeps their diagonal blocks positive definite.
    */
   const double penalty_constant;
 
@@ -389,12 +396,6 @@ private:
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
 
   /**
-   * The ratios of boundary measure to volume of the polytopes, for the
-   * penalty, see PolytopeAdaptivity::shape_ratios().
-   */
-  TrilinosWrappers::MPI::Vector ratios;
-
-  /**
    * The exact solution and the right-hand side $f = -\Delta u$.
    */
   SingularSolution<dim>      exact_solution;
@@ -409,10 +410,16 @@ private:
   Vector<float> copy_indicators;
 
   /**
-   * Largest over mean number of degrees of freedom per rank, had the system
-   * been solved on the p4est triangulation.
+   * Partition the copy by ParMETIS, or keep every polytope on the rank of
+   * its R-tree.
    */
-  double p4est_imbalance;
+  const bool use_parmetis;
+
+  /**
+   * Largest over mean number of degrees of freedom per rank, had every
+   * polytope stayed on the rank of its R-tree.
+   */
+  double tree_imbalance;
 
   /**
    * The error estimator.
@@ -440,6 +447,7 @@ RepartitionedPoissonProblem<dim>::RepartitionedPoissonProblem(
   const unsigned int                              n_cycles,
   const double                                    tolerance,
   const PolytopeAdaptivity::AdaptivityParameters &parameters,
+  const bool                                      use_parmetis,
   const MPI_Comm                                  communicator)
   : comm(communicator)
   , n_subdivisions(n_subdivisions)
@@ -453,7 +461,8 @@ RepartitionedPoissonProblem<dim>::RepartitionedPoissonProblem(
   , penalty_constant(std::sqrt(2.) / 3. * (degree + 1) * (degree + dim))
   , polytopal_mesh(tria, degree, parameters)
   , partitioned_copy(tria)
-  , p4est_imbalance(1.)
+  , use_parmetis(use_parmetis)
+  , tree_imbalance(1.)
   , error_estimator(0.)
   , l2_error(0.)
   , h1_error(0.)
@@ -475,30 +484,46 @@ template <int dim>
 void
 RepartitionedPoissonProblem<dim>::setup_agglomerated_problem()
 {
-  // The imbalance of the degrees of freedom per rank, had the system been
-  // solved on the p4est triangulation.
-  const double local_dofs =
-    double(polytopal_mesh.get_polytopes().size()) * fe_dg.n_dofs_per_cell();
-  p4est_imbalance = Utilities::MPI::max(local_dofs, comm) /
-                    (Utilities::MPI::sum(local_dofs, comm) /
-                     Utilities::MPI::n_mpi_processes(comm));
+  // The imbalance of the degrees of freedom per rank, had every polytope
+  // stayed on the rank of its R-tree. The pieces of a polytope on several
+  // ranks of the p4est triangulation have the same tree rank, so it is
+  // counted once.
+  const unsigned int n_ranks = Utilities::MPI::n_mpi_processes(comm);
+  const std::vector<unsigned int> tree_ranks = polytopal_mesh.get_tree_ranks();
+  std::vector<unsigned int>       tree_rank_of_polytope(
+    polytopal_mesh.n_global_polytopes(), 0);
+  for (std::size_t piece = 0; piece < tree_ranks.size(); ++piece)
+    tree_rank_of_polytope[polytopal_mesh.get_polytope_indices()[piece]] =
+      tree_ranks[piece];
+  Utilities::MPI::max(ArrayView<const unsigned int>(tree_rank_of_polytope),
+                      comm,
+                      make_array_view(tree_rank_of_polytope));
+  std::vector<unsigned int> polytopes_per_rank(n_ranks, 0);
+  for (const unsigned int rank : tree_rank_of_polytope)
+    ++polytopes_per_rank[rank];
+  tree_imbalance = double(*std::max_element(polytopes_per_rank.begin(),
+                                            polytopes_per_rank.end())) /
+                   (double(tree_rank_of_polytope.size()) / n_ranks);
 
   ah.reset();
   cached_tria.reset();
   partitioned_copy.reinit(polytopal_mesh.get_polytopes(),
-                          fe_dg.n_dofs_per_cell());
+                          polytopal_mesh.get_polytope_indices(),
+                          polytopal_mesh.get_polytope_index_offsets(),
+                          fe_dg.n_dofs_per_cell(),
+                          use_parmetis ? std::vector<unsigned int>() :
+                                         tree_ranks);
   cached_tria = std::make_unique<GridTools::Cache<dim>>(
     partitioned_copy.get_triangulation(), mapping);
   ah = std::make_unique<AgglomerationHandler<dim>>(*cached_tria);
   for (const auto &polytope : partitioned_copy.get_polytopes())
     ah->define_agglomerate(polytope);
-  const unsigned int n_q_points = 2 * fe_dg.degree + 1;
+  const unsigned int n_q_points = fe_dg.degree + 1;
   ah->initialize_fe_values(QGauss<dim>(n_q_points),
                            update_values | update_gradients |
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
-  ratios = PolytopeAdaptivity::shape_ratios(*ah);
 }
 
 
@@ -543,9 +568,6 @@ RepartitionedPoissonProblem<dim>::assemble_system()
                            agglo_values.JxW(q);
           }
 
-      const double h = polytope->diameter();
-      const double ratio =
-        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
@@ -556,10 +578,8 @@ RepartitionedPoissonProblem<dim>::assemble_system()
               // PolytopeAdaptivity::boundary_penalty().
               const auto  &fe_face = ah->reinit(polytope, f);
               const auto  &normals = fe_face.get_normal_vectors();
-              const double sigma =
-                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                          h,
-                                                          ratio);
+              const double sigma   = PolytopeAdaptivity::boundary_penalty<dim>(
+                penalty_constant, polytope->get_bounding_box());
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -583,23 +603,10 @@ RepartitionedPoissonProblem<dim>::assemble_system()
             ah->reinit_interface(polytope, neighbor, f, neighbor_face);
           const auto &fe_faces0 = fe_faces.first;
           neighbor->get_dof_indices(neighbor_dof_indices);
-          // diameter() is not available for a polytope of another rank, its
-          // bounding-box diagonal is.
-          double h_neighbor;
-          if (neighbor->is_locally_owned())
-            h_neighbor = neighbor->diameter();
-          else
-            {
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              h_neighbor = (corners.second - corners.first).norm();
-            }
           const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
             penalty_constant,
-            h,
-            h_neighbor,
-            ratio,
-            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+            polytope->get_bounding_box(),
+            neighbor->get_bounding_box());
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
@@ -669,11 +676,9 @@ template <int dim>
 void
 RepartitionedPoissonProblem<dim>::solve()
 {
-  // deal.II's AMG for an elliptic problem.
-  TrilinosWrappers::PreconditionAMG                 amg;
-  TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-  amg_data.elliptic = true;
-  amg.initialize(system_matrix, amg_data);
+  // Algebraic multigrid with one smoother block per polytope.
+  TrilinosWrappers::PreconditionAMG amg;
+  PolytopeAdaptivity::initialize_polytope_amg(amg, system_matrix, *ah);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        solver_control(10000, 1e-13, 1e-7);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(solver_control);
@@ -723,7 +728,6 @@ RepartitionedPoissonProblem<dim>::estimate_and_compute_errors()
                                                   locally_relevant_solution,
                                                   rhs_function,
                                                   penalty_constant,
-                                                  ratios,
                                                   copy_indicators);
   partitioned_copy.copy_to_p4est(copy_indicators, cell_indicators);
   double sum_sq = 0.;
@@ -822,7 +826,7 @@ RepartitionedPoissonProblem<dim>::run()
   pcout << "Running with " << Utilities::MPI::n_mpi_processes(comm)
         << " MPI ranks." << std::endl;
   pcout << "cycle  polytopes      dofs   estimator       L2 error        "
-           "H1 error        imbalance p4est / copy"
+           "H1 error        imbalance tree / copy"
         << std::endl;
   for (unsigned int cycle = 0; cycle < n_cycles; ++cycle)
     {
@@ -834,7 +838,7 @@ RepartitionedPoissonProblem<dim>::run()
             << polytopal_mesh.n_global_polytopes() << std::setw(10)
             << ah->n_dofs() << "   " << std::left << std::setw(16)
             << error_estimator << std::setw(16) << l2_error << std::setw(16)
-            << h1_error << p4est_imbalance << " / "
+            << h1_error << tree_imbalance << " / "
             << partitioned_copy.dof_imbalance() << std::right << std::endl;
       // Uncomment to write the solution and the polytopes for ParaView.
       // output_results(cycle, cycle);
@@ -859,14 +863,21 @@ main(int argc, char *argv[])
   const MPI_Comm                   comm = MPI_COMM_WORLD;
 
   PolytopeAdaptivity::AdaptivityParameters parameters;
-  parameters.max_cells_per_polytope = 64;
-  parameters.level_rule = PolytopeAdaptivity::LevelRule::multiple_levels;
+  parameters.max_cells_per_polytope = 256;
+  parameters.level_rule        = PolytopeAdaptivity::LevelRule::multiple_levels;
+  parameters.initial_partition = PolytopeAdaptivity::InitialPartition::metis;
 
-  const unsigned int             n_subdivisions = 64;
+  const unsigned int             n_subdivisions = 256;
   const unsigned int             degree         = 4;
   const unsigned int             n_cycles       = 20;
   const double                   tolerance      = 2.5e-5;
-  RepartitionedPoissonProblem<2> problem(
-    n_subdivisions, degree, n_cycles, tolerance, parameters, comm);
+  const bool                     use_parmetis   = true;
+  RepartitionedPoissonProblem<2> problem(n_subdivisions,
+                                         degree,
+                                         n_cycles,
+                                         tolerance,
+                                         parameters,
+                                         use_parmetis,
+                                         comm);
   problem.run();
 }

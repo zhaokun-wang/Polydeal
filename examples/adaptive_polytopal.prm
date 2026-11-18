@@ -6,13 +6,18 @@ subsection Adaptive polytopal solver
     # tolerance.
     set Coarsening fraction    = 0.02
 
+    # Which rank builds the R-tree over an initial cell. 'p4est': the rank that
+    # owns it on the p4est mesh. 'metis': the rank METIS assigns it to; on more
+    # than one rank this requires solving on a partitioned copy.
+    set Initial partition      = p4est
+
     # 'multiple': as many levels per adaptation as the error indicator
     # predicts. 'single': one level.
     set Level rule             = multiple
 
     # The largest number of initial cells in a polytope. It bounds the initial
     # polytopes and every merge.
-    set Max cells per polytope = 64
+    set Max cells per polytope = 256
 
     # The largest number of adaptive cycles of the Poisson problem.
     set Number of cycles       = 20
@@ -26,12 +31,25 @@ subsection Adaptive polytopal solver
     # The polynomial degree of the elements.
     set Degree                 = 4
 
+    # If not empty, a two-dimensional gmsh file whose mesh, refined globally,
+    # is the initial mesh instead of the unit square, for 'singular' and
+    # 'constant'. Its domain must be a rectangle: the window of the point
+    # singularity is fitted to it, and the singular point is the vertex of the
+    # file nearest its centre.
+    set Mesh file              =
+
+    # The global refinements of the mesh file.
+    set Mesh file refinements  = 0
+
     # The initial mesh divides the unit square into this many cells per
     # direction.
-    set Number of subdivisions = 64
+    set Number of subdivisions = 256
 
-    # 'singular': the Poisson problem with a point singularity. 'heat': the
-    # heat equation with a moving peak.
+    # 'singular': the Poisson problem with a point singularity. 'constant':
+    # the Poisson problem with f = 1, which has no exact solution to compare
+    # with. 'polynomial': the Poisson problem with u = x(1 - x) y(1 - y)(1 + x
+    # + 2 y^2), only on the unit square. 'heat': the heat equation with a
+    # moving peak.
     set Problem                = singular
   end
 
@@ -41,14 +59,17 @@ subsection Adaptive polytopal solver
   end
 
   subsection Repartition
-    # Solve on a copy of the mesh partitioned by ParMETIS on the graph of the
-    # polytopes.
-    set Solve on a partitioned copy = false
+    # Partition the copy by ParMETIS on the graph of the polytopes. Otherwise
+    # every polytope goes to the rank whose R-tree holds its initial cells.
+    set Partition the copy by ParMETIS = true
+
+    # Solve on a copy of the mesh on which every polytope lies on one rank.
+    set Solve on a partitioned copy    = false
   end
 
   subsection Time stepping
     # The final time T.
-    set Final time                 = 0.2
+    set Final time                 = 0.6
 
     # Adaptations of the mesh of the initial value.
     set Initial adaptations        = 5

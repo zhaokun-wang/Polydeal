@@ -27,9 +27,10 @@
 #include <deal.II/distributed/p4est_wrappers.h>
 #include <deal.II/distributed/tria.h>
 
-#include <deal.II/fe/fe_nothing.h>
-#include <deal.II/fe/fe_values.h>
+#include <deal.II/grid/grid_tools.h>
 
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/trilinos_sparse_matrix.h>
 #include <deal.II/lac/trilinos_vector.h>
 #include <deal.II/lac/vector.h>
 
@@ -38,7 +39,9 @@
 
 #include <boost/geometry/index/rtree.hpp>
 
+#include <Teuchos_ParameterList.hpp>
 #include <agglomeration_handler.h>
+#include <ml_MultiLevelPreconditioner.h>
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +77,32 @@ namespace dealii::PolytopeAdaptivity
      * here a level is a step in the R-tree or a refinement level of p4est.
      */
     multiple_levels
+  };
+
+
+
+  /**
+   * Which rank builds the R-tree over an initial cell.
+   */
+  enum class InitialPartition
+  {
+    /**
+     * The rank that owns the initial cell on the p4est triangulation. The
+     * initial cells of a rank are a stretch of the space-filling curve of
+     * p4est. On a mesh of $2^n \times 2^n$ cells and a power of two ranks it
+     * is a rectangle, otherwise in general a staircase, along which the
+     * R-tree cuts long, thin polytopes.
+     */
+    p4est,
+    /**
+     * The rank that METIS assigns the initial cell to, by
+     * GridTools::partition_triangulation() on the graph of the faces between
+     * the initial cells. A polytope may then hold initial cells of several
+     * ranks of the p4est triangulation, and the system must be solved on a
+     * copy of the mesh on which every polytope lies on one rank, see
+     * PolytopeRepartition::PartitionedCopy.
+     */
+    metis
   };
 
 
@@ -128,6 +157,11 @@ namespace dealii::PolytopeAdaptivity
      * at or under $2^{-2\,\text{rate}}$ times the tolerance.
      */
     unsigned int coarsening_damping = 1;
+
+    /**
+     * Which rank builds the R-tree over an initial cell.
+     */
+    InitialPartition initial_partition = InitialPartition::p4est;
   };
 
 
@@ -795,9 +829,9 @@ namespace dealii::PolytopeAdaptivity
    * coarsened in both directions.
    *
    * The initial cells are the coarse cells of the triangulation, the cells of
-   * level zero. Every rank builds one R-tree over the initial cells it owns,
-   * and every node of the tree is a polytope. At the start the current
-   * polytopes are, down every branch, the first polytope of at most
+   * level zero. Every rank builds one R-tree over its initial cells, and every
+   * node of the tree is a polytope. At the start the current polytopes are,
+   * down every branch, the first polytope of at most
    * AdaptivityParameters::max_cells_per_polytope initial cells. Polytopes
    * are refined down the tree and merged back up it. Below a single initial
    * cell, p4est refines and coarsens the cell, and every active descendant
@@ -805,8 +839,25 @@ namespace dealii::PolytopeAdaptivity
    *
    * The triangulation must be created with the setting
    * parallel::distributed::Triangulation::no_automatic_repartitioning: cells
-   * then never change their rank, so every polytope of a rank's tree stays
-   * on one rank, and all decisions are local.
+   * then never change their rank.
+   *
+   * The initial cells of a rank's tree are, by
+   * AdaptivityParameters::initial_partition, the ones it owns on the p4est
+   * triangulation, or the ones METIS assigns to it. In the first case every
+   * polytope lies on one rank and all decisions are local. In the second, the
+   * rank that holds an initial cell in its tree, its tree rank, is in general
+   * not the rank that owns it on the p4est triangulation, its p4est rank.
+   * Both stay fixed, so every rank exchanges data with the same ranks about
+   * the same initial cells in every adaptation: the p4est rank sends the data
+   * the tree needs, the error indicator of the initial cell and whether p4est
+   * has refined it, and the tree rank sends back the decisions of the tree,
+   * the polytope of the initial cell and the levels by which p4est is to
+   * refine it.
+   *
+   * Every polytope has a global polytope index. Rank r holds the indices
+   * from get_polytope_index_offsets()[r] to get_polytope_index_offsets()[r+1]
+   * - 1: first the active descendants of the refined initial cells it owns on
+   * the p4est triangulation, then the polytopes of its tree.
    *
    * Marking is against a tolerance for the error estimator, shared equally
    * by the $N$ polytopes: $\text{tol}_P = \text{TOL} / \sqrt{N}$. When every
@@ -829,7 +880,7 @@ namespace dealii::PolytopeAdaptivity
       const AdaptivityParameters &parameters = AdaptivityParameters());
 
     /**
-     * Build the R-tree over the initial cells this rank owns, and the current
+     * Build the R-tree over the initial cells of this rank, and the current
      * polytopes at the start. The triangulation must not be refined yet.
      */
     void
@@ -837,10 +888,36 @@ namespace dealii::PolytopeAdaptivity
 
     /**
      * The polytopes of this rank, each a face-connected list of locally
-     * owned active cells.
+     * owned active cells. With InitialPartition::metis a polytope may hold
+     * cells of several ranks, and every rank then lists the part it owns,
+     * possibly in several face-connected pieces. The pieces of one polytope
+     * have the same global polytope index, see get_polytope_indices().
      */
     const std::vector<std::vector<CellIterator>> &
     get_polytopes() const;
+
+    /**
+     * The global polytope index of every polytope, or piece of a polytope, of
+     * get_polytopes().
+     */
+    const std::vector<types::global_cell_index> &
+    get_polytope_indices() const;
+
+    /**
+     * For every rank r, the first global polytope index it holds, and at the
+     * end the number of polytopes over all ranks.
+     */
+    const std::vector<types::global_cell_index> &
+    get_polytope_index_offsets() const;
+
+    /**
+     * The tree rank of every polytope, or piece of a polytope, of
+     * get_polytopes(): the rank whose tree holds the initial cells of the
+     * polytope, or the initial cell an active descendant lies in. With
+     * InitialPartition::p4est it is this rank.
+     */
+    std::vector<unsigned int>
+    get_tree_ranks() const;
 
     /**
      * Number of polytopes over all ranks.
@@ -909,11 +986,12 @@ namespace dealii::PolytopeAdaptivity
 
     /**
      * The data the tree needs per initial cell, from the error indicators
-     * @p cell_indicators of the active cells, indexed by tree index. For the
-     * initial cell with tree index i, error_sq[i] is the sum of the squared
-     * error indicators of the active cells inside it: its own if p4est has not
-     * refined it, else those of its active descendants. is_refined[i] is one
-     * if p4est has refined it.
+     * @p cell_indicators of the active cells, computed on the p4est rank and
+     * sent to the tree rank, indexed by tree index. For the initial cell with
+     * tree index i, error_sq[i] is the sum of the squared error indicators of
+     * the active cells inside it: its own if p4est has not refined it, else
+     * those of its active descendants. is_refined[i] is one if p4est has
+     * refined it.
      */
     void
     initial_cell_data(const Vector<float>       &cell_indicators,
@@ -921,11 +999,44 @@ namespace dealii::PolytopeAdaptivity
                       std::vector<unsigned int> &is_refined) const;
 
     /**
-     * The tree index of the initial cell that contains @p cell, which is
-     * @p cell itself or the initial cell it descends from.
+     * The index, among the initial cells this rank owns on the p4est
+     * triangulation, of the initial cell that contains @p cell, which is
+     * @p cell itself or the initial cell it descends from. With
+     * InitialPartition::p4est it is the tree index.
      */
     unsigned int
     initial_cell(const CellIterator &cell) const;
+
+    /**
+     * Send @p n_values values per initial cell from the p4est ranks to the
+     * tree ranks: @p owned_values holds them for the initial cells this rank
+     * owns, the result for the initial cells of its tree, in the order of
+     * their tree index. With InitialPartition::p4est the two are the same.
+     */
+    std::vector<double>
+    to_tree_ranks(const std::vector<double> &owned_values,
+                  const unsigned int         n_values) const;
+
+    /**
+     * Send @p n_values values per initial cell from the tree ranks back to
+     * the p4est ranks, the reverse of to_tree_ranks().
+     */
+    std::vector<double>
+    to_p4est_ranks(const std::vector<double> &tree_values,
+                   const unsigned int         n_values) const;
+
+    /**
+     * The polytopes of the tree with InitialPartition::metis, computed on the
+     * tree rank: every current polytope of the tree, without its initial
+     * cells that p4est has refined, split into face-connected components,
+     * numbered from zero. @p n_components is set to their number. For every
+     * initial cell of the tree, three values are returned: the number of its
+     * component (-1 if p4est has refined it), the number of initial cells of
+     * the component, and the number of initial cells of its current polytope
+     * in the tree.
+     */
+    std::vector<double>
+    tree_components(unsigned int &n_components) const;
 
     /**
      * The triangulation the polytopes are made of.
@@ -948,20 +1059,57 @@ namespace dealii::PolytopeAdaptivity
     internal::PolytopeTree tree;
 
     /**
-     * For every initial cell of this rank, its tree index, keyed by its coarse
-     * cell id. deal.II calls the cells of the initial mesh coarse
-     * cells, and the CellId of every cell starts with the coarse cell id of
-     * the initial cell it descends from. This map therefore finds the
-     * initial cell of any active cell, see initial_cell().
+     * For every initial cell this rank owns on the p4est triangulation, its
+     * index among them, keyed by its coarse cell id. deal.II calls the cells
+     * of the initial mesh coarse cells, and the CellId of every cell starts
+     * with the coarse cell id of the initial cell it descends from. This map
+     * therefore finds the initial cell of any active cell, see
+     * initial_cell().
      */
     std::unordered_map<types::coarse_cell_id, unsigned int>
       initial_of_coarse_cell_id;
 
     /**
+     * With InitialPartition::metis, for every rank r: the indices, among the
+     * initial cells this rank owns, of those in the tree of r, and the tree
+     * indices of the initial cells of this rank's tree that r owns. Both in
+     * the order of the coarse cell ids, so that the two ranks agree on the
+     * order and only values are sent.
+     */
+    std::vector<std::vector<unsigned int>> owned_for_tree_rank;
+    std::vector<std::vector<unsigned int>> tree_from_p4est_rank;
+
+    /**
+     * The tree rank of every initial cell this rank owns.
+     */
+    std::vector<unsigned int> tree_rank_of_owned;
+
+    /**
+     * With InitialPartition::metis, the initial cells of the tree by tree
+     * index, to find the faces between them, and for each whether p4est has
+     * refined it, as of the last adaptation.
+     */
+    std::vector<typename Triangulation<dim>::cell_iterator> tree_cells;
+    std::vector<unsigned int>                               tree_is_refined;
+
+    /**
+     * For every initial cell this rank owns, the number of initial cells of
+     * its current polytope in the tree.
+     */
+    std::vector<unsigned int> tree_polytope_size;
+
+    /**
      * The current polytopes of this rank, each as the list of its active
-     * cells.
+     * cells, and their global polytope indices.
      */
     std::vector<std::vector<CellIterator>> current_polytopes;
+    std::vector<types::global_cell_index>  polytope_indices;
+
+    /**
+     * The first global polytope index of every rank, and the number of
+     * polytopes over all ranks.
+     */
+    std::vector<types::global_cell_index> polytope_index_offsets;
 
     /**
      * For every locally owned active cell, the number of cells of its
@@ -994,38 +1142,107 @@ namespace dealii::PolytopeAdaptivity
   void
   AdaptivePolytopalMesh<dim>::initialize()
   {
-    // The bounding box of every initial cell of this rank, in the order of
-    // the cell indices.
-    std::vector<std::pair<BoundingBox<dim>, unsigned int>> boxes;
-    for (const auto &cell : tria.active_cell_iterators())
-      if (cell->is_locally_owned())
-        {
-          AssertThrow(cell->level() == 0,
-                      ExcMessage("The polytopes are built on the coarse "
-                                 "mesh, before any refinement."));
-          boxes.emplace_back(cell->bounding_box(), cell->index());
-        }
-    std::sort(boxes.begin(), boxes.end(), [](const auto &a, const auto &b) {
-      return a.second < b.second;
-    });
+    const MPI_Comm     comm    = tria.get_mpi_communicator();
+    const unsigned int n_ranks = Utilities::MPI::n_mpi_processes(comm);
+    const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+    const bool metis = parameters.initial_partition == InitialPartition::metis;
+    AssertThrow(tria.n_levels() == 1,
+                ExcMessage("The polytopes are built on the coarse mesh, "
+                           "before any refinement."));
 
-    // The tree index of an initial cell is its position in the order of the
-    // cell indices.
-    std::map<unsigned int, unsigned int> initial_of_index;
-    for (unsigned int tree_index = 0; tree_index < boxes.size(); ++tree_index)
+    // Every rank holds all initial cells, the ones it does not own as
+    // artificial cells. With METIS, rank 0 partitions a serial copy of them
+    // and sends the tree rank of every initial cell, by cell index, to all
+    // ranks.
+    std::vector<unsigned int> tree_rank(tria.n_cells(0), my_rank);
+    if (metis && n_ranks > 1)
       {
-        initial_of_index[boxes[tree_index].second] = tree_index;
-        boxes[tree_index].second                   = tree_index;
+        if (my_rank == 0)
+          {
+            std::vector<CellData<dim>> cells(tria.n_cells(0));
+            for (const auto &cell : tria.cell_iterators_on_level(0))
+              for (const unsigned int v : cell->vertex_indices())
+                cells[cell->index()].vertices[v] = cell->vertex_index(v);
+            Triangulation<dim> serial;
+            serial.create_triangulation(tria.get_vertices(),
+                                        cells,
+                                        SubCellData());
+            GridTools::partition_triangulation(
+              n_ranks, serial, SparsityTools::Partitioner::metis);
+            for (const auto &cell : serial.active_cell_iterators())
+              tree_rank[cell->index()] = cell->subdomain_id();
+          }
+        tree_rank = Utilities::MPI::broadcast(comm, tree_rank, 0);
+      }
+
+    // The initial cells of the tree and the ones this rank owns, in the order
+    // of the cell indices. With InitialPartition::p4est they are the same.
+    std::vector<typename Triangulation<dim>::cell_iterator> owned_cells;
+    tree_cells.clear();
+    for (const auto &cell : tria.cell_iterators_on_level(0))
+      {
+        if (cell->is_locally_owned())
+          owned_cells.push_back(cell);
+        if (metis ? tree_rank[cell->index()] == my_rank :
+                    cell->is_locally_owned())
+          tree_cells.push_back(cell);
+      }
+
+    // The tree index of an initial cell is its position among the initial
+    // cells of the tree.
+    std::vector<std::pair<BoundingBox<dim>, unsigned int>> boxes;
+    std::map<unsigned int, unsigned int>                   tree_index_of_cell;
+    for (unsigned int tree_index = 0; tree_index < tree_cells.size();
+         ++tree_index)
+      {
+        boxes.emplace_back(tree_cells[tree_index]->bounding_box(), tree_index);
+        tree_index_of_cell[tree_cells[tree_index]->index()] = tree_index;
       }
     tree.build(boxes, parameters.max_cells_per_polytope);
+    tree_is_refined.assign(tree_cells.size(), 0);
 
-    // The tree index by coarse cell id. Every descendant of an initial cell
-    // has the same coarse cell id.
+    // The index among the owned initial cells by coarse cell id. Every
+    // descendant of an initial cell has the same coarse cell id.
     initial_of_coarse_cell_id.clear();
-    for (const auto &cell : tria.active_cell_iterators())
-      if (cell->is_locally_owned())
-        initial_of_coarse_cell_id[cell->id().get_coarse_cell_id()] =
-          initial_of_index.at(cell->index());
+    tree_rank_of_owned.resize(owned_cells.size());
+    for (unsigned int owned = 0; owned < owned_cells.size(); ++owned)
+      {
+        initial_of_coarse_cell_id
+          [owned_cells[owned]->id().get_coarse_cell_id()] = owned;
+        tree_rank_of_owned[owned] = tree_rank[owned_cells[owned]->index()];
+      }
+
+    // With METIS, every rank tells the tree rank of each of its initial
+    // cells that it owns it. Both sides list the initial cells they share in
+    // the order of the coarse cell ids.
+    owned_for_tree_rank.assign(metis ? n_ranks : 0, {});
+    tree_from_p4est_rank.assign(metis ? n_ranks : 0, {});
+    if (metis)
+      {
+        std::vector<types::coarse_cell_id> coarse_cell_id(tria.n_cells(0));
+        for (const auto &cell : tria.cell_iterators_on_level(0))
+          coarse_cell_id[cell->index()] = cell->id().get_coarse_cell_id();
+
+        // The cell indices of the owned initial cells, by tree rank.
+        std::map<unsigned int, std::vector<unsigned int>> cells_to_send;
+        for (const auto &cell : owned_cells)
+          cells_to_send[tree_rank[cell->index()]].push_back(cell->index());
+        for (auto &[rank, cell_indices] : cells_to_send)
+          {
+            std::sort(cell_indices.begin(),
+                      cell_indices.end(),
+                      [&](const unsigned int a, const unsigned int b) {
+                        return coarse_cell_id[a] < coarse_cell_id[b];
+                      });
+            for (const unsigned int index : cell_indices)
+              owned_for_tree_rank[rank].push_back(
+                initial_of_coarse_cell_id.at(coarse_cell_id[index]));
+          }
+        for (const auto &[rank, cell_indices] :
+             Utilities::MPI::some_to_some(comm, cells_to_send))
+          for (const unsigned int index : cell_indices)
+            tree_from_p4est_rank[rank].push_back(tree_index_of_cell.at(index));
+      }
 
     update_polytopes();
   }
@@ -1038,6 +1255,38 @@ namespace dealii::PolytopeAdaptivity
   AdaptivePolytopalMesh<dim>::get_polytopes() const
   {
     return current_polytopes;
+  }
+
+
+
+  template <int dim>
+  const std::vector<types::global_cell_index> &
+  AdaptivePolytopalMesh<dim>::get_polytope_indices() const
+  {
+    return polytope_indices;
+  }
+
+
+
+  template <int dim>
+  const std::vector<types::global_cell_index> &
+  AdaptivePolytopalMesh<dim>::get_polytope_index_offsets() const
+  {
+    return polytope_index_offsets;
+  }
+
+
+
+  template <int dim>
+  std::vector<unsigned int>
+  AdaptivePolytopalMesh<dim>::get_tree_ranks() const
+  {
+    // All cells of a polytope lie in initial cells of one tree.
+    std::vector<unsigned int> tree_ranks;
+    tree_ranks.reserve(current_polytopes.size());
+    for (const auto &polytope : current_polytopes)
+      tree_ranks.push_back(tree_rank_of_owned[initial_cell(polytope.front())]);
+    return tree_ranks;
   }
 
 
@@ -1077,18 +1326,160 @@ namespace dealii::PolytopeAdaptivity
     std::vector<unsigned int> &is_refined) const
   {
     // An active cell of a level above zero is an active descendant of a
-    // refined initial cell.
-    error_sq.assign(tree.current_polytope_of.size(), 0.);
-    is_refined.assign(tree.current_polytope_of.size(), 0);
+    // refined initial cell. Two values per owned initial cell: the sum of
+    // the squared error indicators, and one if it is refined.
+    std::vector<double> owned_values(2 * initial_of_coarse_cell_id.size(), 0.);
     for (const auto &cell : tria.active_cell_iterators())
       if (cell->is_locally_owned())
         {
           const unsigned int initial = initial_cell(cell);
           const double       error = cell_indicators[cell->active_cell_index()];
-          error_sq[initial] += error * error;
+          owned_values[2 * initial] += error * error;
           if (cell->level() > 0)
-            is_refined[initial] = 1;
+            owned_values[2 * initial + 1] = 1.;
         }
+    const std::vector<double> tree_values = to_tree_ranks(owned_values, 2);
+    error_sq.resize(tree_cells.size());
+    is_refined.resize(tree_cells.size());
+    for (unsigned int i = 0; i < tree_cells.size(); ++i)
+      {
+        error_sq[i]   = tree_values[2 * i];
+        is_refined[i] = static_cast<unsigned int>(tree_values[2 * i + 1]);
+      }
+  }
+
+
+
+  template <int dim>
+  std::vector<double>
+  AdaptivePolytopalMesh<dim>::to_tree_ranks(
+    const std::vector<double> &owned_values,
+    const unsigned int         n_values) const
+  {
+    if (parameters.initial_partition == InitialPartition::p4est)
+      return owned_values;
+    std::map<unsigned int, std::vector<double>> values_to_send;
+    for (unsigned int rank = 0; rank < owned_for_tree_rank.size(); ++rank)
+      for (const unsigned int owned : owned_for_tree_rank[rank])
+        values_to_send[rank].insert(values_to_send[rank].end(),
+                                    owned_values.begin() + n_values * owned,
+                                    owned_values.begin() +
+                                      n_values * (owned + 1));
+    std::vector<double> tree_values(n_values * tree_cells.size());
+    for (const auto &[rank, values] :
+         Utilities::MPI::some_to_some(tria.get_mpi_communicator(),
+                                      values_to_send))
+      for (unsigned int k = 0; k < tree_from_p4est_rank[rank].size(); ++k)
+        std::copy(values.begin() + n_values * k,
+                  values.begin() + n_values * (k + 1),
+                  tree_values.begin() +
+                    n_values * tree_from_p4est_rank[rank][k]);
+    return tree_values;
+  }
+
+
+
+  template <int dim>
+  std::vector<double>
+  AdaptivePolytopalMesh<dim>::to_p4est_ranks(
+    const std::vector<double> &tree_values,
+    const unsigned int         n_values) const
+  {
+    if (parameters.initial_partition == InitialPartition::p4est)
+      return tree_values;
+    std::map<unsigned int, std::vector<double>> values_to_send;
+    for (unsigned int rank = 0; rank < tree_from_p4est_rank.size(); ++rank)
+      for (const unsigned int tree_index : tree_from_p4est_rank[rank])
+        values_to_send[rank].insert(values_to_send[rank].end(),
+                                    tree_values.begin() + n_values * tree_index,
+                                    tree_values.begin() +
+                                      n_values * (tree_index + 1));
+    std::vector<double> owned_values(n_values *
+                                     initial_of_coarse_cell_id.size());
+    for (const auto &[rank, values] :
+         Utilities::MPI::some_to_some(tria.get_mpi_communicator(),
+                                      values_to_send))
+      for (unsigned int k = 0; k < owned_for_tree_rank[rank].size(); ++k)
+        std::copy(values.begin() + n_values * k,
+                  values.begin() + n_values * (k + 1),
+                  owned_values.begin() +
+                    n_values * owned_for_tree_rank[rank][k]);
+    return owned_values;
+  }
+
+
+
+  template <int dim>
+  std::vector<double>
+  AdaptivePolytopalMesh<dim>::tree_components(unsigned int &n_components) const
+  {
+    // The initial cells of every current polytope of the tree that p4est has
+    // not refined, in the order of their CellId, as on the p4est triangulation
+    // with InitialPartition::p4est.
+    std::map<int, std::vector<unsigned int>> cells_of_polytope;
+    for (unsigned int i = 0; i < tree_cells.size(); ++i)
+      if (tree_is_refined[i] == 0)
+        cells_of_polytope[tree.current_polytope_of[i]].push_back(i);
+    std::map<unsigned int, unsigned int> tree_index_of_cell;
+    for (unsigned int i = 0; i < tree_cells.size(); ++i)
+      tree_index_of_cell[tree_cells[i]->index()] = i;
+
+    std::vector<double> values(3 * tree_cells.size(), -1.);
+    for (unsigned int i = 0; i < tree_cells.size(); ++i)
+      {
+        values[3 * i + 1] = 1.;
+        values[3 * i + 2] = tree.current_polytope_size(i);
+      }
+
+    // Every breadth-first search from a cell not yet reached gives one
+    // component, as in split_into_connected_components().
+    n_components = 0;
+    for (auto &[polytope, cells] : cells_of_polytope)
+      {
+        std::sort(cells.begin(),
+                  cells.end(),
+                  [&](const unsigned int a, const unsigned int b) {
+                    return tree_cells[a]->id() < tree_cells[b]->id();
+                  });
+        const std::set<unsigned int> in_polytope(cells.begin(), cells.end());
+        std::set<unsigned int>       visited;
+        for (const unsigned int start : cells)
+          {
+            if (visited.count(start) > 0)
+              continue;
+            std::vector<unsigned int> component;
+            std::queue<unsigned int>  queue;
+            visited.insert(start);
+            queue.push(start);
+            while (!queue.empty())
+              {
+                const unsigned int i = queue.front();
+                queue.pop();
+                component.push_back(i);
+                for (const unsigned int f : tree_cells[i]->face_indices())
+                  if (!tree_cells[i]->at_boundary(f))
+                    {
+                      const auto neighbor = tree_cells[i]->neighbor(f);
+                      const auto found =
+                        tree_index_of_cell.find(neighbor->index());
+                      if (found != tree_index_of_cell.end() &&
+                          in_polytope.count(found->second) > 0 &&
+                          visited.count(found->second) == 0)
+                        {
+                          visited.insert(found->second);
+                          queue.push(found->second);
+                        }
+                    }
+              }
+            for (const unsigned int i : component)
+              {
+                values[3 * i]     = n_components;
+                values[3 * i + 1] = component.size();
+              }
+            ++n_components;
+          }
+      }
+    return values;
   }
 
 
@@ -1097,45 +1488,104 @@ namespace dealii::PolytopeAdaptivity
   void
   AdaptivePolytopalMesh<dim>::update_polytopes()
   {
-    // Every active descendant is a polytope of its own. The initial cells
-    // that are not refined are grouped by their current polytope in the
-    // tree.
+    const MPI_Comm     comm    = tria.get_mpi_communicator();
+    const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+    const bool metis = parameters.initial_partition == InitialPartition::metis;
+
+    // Every active descendant is a polytope of its own.
     current_polytopes.clear();
-    std::map<int, std::vector<CellIterator>> cells_of_polytope;
     for (const auto &cell : tria.active_cell_iterators())
-      if (cell->is_locally_owned())
-        {
-          if (cell->level() > 0)
-            current_polytopes.push_back({cell});
-          else
+      if (cell->is_locally_owned() && cell->level() > 0)
+        current_polytopes.push_back({cell});
+    const unsigned int n_descendants = current_polytopes.size();
+
+    // The initial cells that are not refined, grouped by their polytope:
+    // with InitialPartition::p4est by their current polytope in the tree,
+    // with InitialPartition::metis by the component of it the tree rank
+    // computed. The cells of a polytope are listed in the order of their
+    // CellId. The AgglomerationHandler makes the first cell of the list the
+    // master cell and orders the quadrature points of the polytope by this
+    // list. PolytopeRepartition::PartitionedCopy, the copy of the mesh on
+    // which the system can be solved instead, lists the cells in the same
+    // order, so that the two meshes give the same discrete problem.
+    // The global polytope indices: rank r holds its descendants, then the
+    // polytopes of its tree, which with InitialPartition::metis its tree rank
+    // counts.
+    const auto set_index_offsets = [&](const types::global_cell_index count) {
+      polytope_index_offsets = {0};
+      for (const auto n : Utilities::MPI::all_gather(comm, count))
+        polytope_index_offsets.push_back(polytope_index_offsets.back() + n);
+      n_polytopes_global = polytope_index_offsets.back();
+    };
+    tree_polytope_size.resize(initial_of_coarse_cell_id.size());
+    std::vector<double> owned_values;
+    std::map<types::global_cell_index, std::vector<CellIterator>>
+      cells_of_polytope;
+    if (!metis)
+      {
+        for (unsigned int owned = 0; owned < tree_polytope_size.size(); ++owned)
+          tree_polytope_size[owned] = tree.current_polytope_size(owned);
+        for (const auto &cell : tria.active_cell_iterators())
+          if (cell->is_locally_owned() && cell->level() == 0)
             cells_of_polytope[tree.current_polytope_of[initial_cell(cell)]]
               .push_back(cell);
-        }
-    // The cells of a polytope are listed in the order of their CellId. The
-    // AgglomerationHandler makes the first cell of the list the master cell
-    // and orders the quadrature points of the polytope by this list.
-    // PolytopeRepartition::PartitionedCopy, the copy of the mesh on which the
-    // system can be solved instead, lists the cells in the same order, so
-    // that the two meshes give the same discrete problem.
+      }
+    else
+      {
+        unsigned int        n_components = 0;
+        std::vector<double> tree_values  = tree_components(n_components);
+        set_index_offsets(n_descendants + n_components);
+        const types::global_cell_index first_component =
+          polytope_index_offsets[my_rank] + n_descendants;
+        for (unsigned int i = 0; i < tree_cells.size(); ++i)
+          if (tree_values[3 * i] >= 0.)
+            tree_values[3 * i] += first_component;
+        owned_values = to_p4est_ranks(tree_values, 3);
+        for (unsigned int owned = 0; owned < tree_polytope_size.size(); ++owned)
+          tree_polytope_size[owned] =
+            static_cast<unsigned int>(owned_values[3 * owned + 2]);
+        for (const auto &cell : tria.active_cell_iterators())
+          if (cell->is_locally_owned() && cell->level() == 0)
+            cells_of_polytope[static_cast<types::global_cell_index>(
+                                owned_values[3 * initial_cell(cell)])]
+              .push_back(cell);
+      }
+
+    // A polytope of the tree need not be connected through faces, nor need
+    // the part of a polytope on one rank. With InitialPartition::metis the
+    // pieces of one polytope keep its index; with InitialPartition::p4est
+    // every piece is a polytope, numbered in order.
+    std::vector<types::global_cell_index> local_index(n_descendants);
+    for (unsigned int i = 0; i < n_descendants; ++i)
+      local_index[i] = i;
     for (auto &[polytope, cells] : cells_of_polytope)
       {
         std::sort(cells.begin(), cells.end(), [](const auto &a, const auto &b) {
           return a->id() < b->id();
         });
-        current_polytopes.push_back(std::move(cells));
+        for (auto &piece : split_into_connected_components<dim>({cells}))
+          {
+            current_polytopes.push_back(std::move(piece));
+            local_index.push_back(metis ? polytope : local_index.size());
+          }
       }
-    // A polytope of the tree need not be connected through faces.
-    current_polytopes = split_into_connected_components<dim>(current_polytopes);
+    if (!metis)
+      set_index_offsets(current_polytopes.size());
+    polytope_indices.resize(current_polytopes.size());
+    for (unsigned int i = 0; i < current_polytopes.size(); ++i)
+      polytope_indices[i] = (metis && i >= n_descendants) ?
+                              local_index[i] :
+                              polytope_index_offsets[my_rank] + local_index[i];
 
-    // The size of the polytope of every cell, and the number of polytopes
-    // over all ranks.
-
+    // The size of the polytope of every cell: with InitialPartition::metis
+    // the size the tree rank computed, which counts the cells on all ranks.
     polytope_size.reinit(tria.n_active_cells());
     for (const auto &polytope : current_polytopes)
       for (const auto &cell : polytope)
-        polytope_size[cell->active_cell_index()] = polytope.size();
-    n_polytopes_global = Utilities::MPI::sum<types::global_cell_index>(
-      current_polytopes.size(), tria.get_mpi_communicator());
+        polytope_size[cell->active_cell_index()] =
+          (!metis || cell->level() > 0) ?
+            polytope.size() :
+            owned_values[3 * initial_cell(cell) + 1];
   }
 
 
@@ -1163,15 +1613,19 @@ namespace dealii::PolytopeAdaptivity
     Vector<float> pending(tria.n_active_cells());
 
     // For LevelRule::multiple_levels: the number of levels by which p4est is
-    // to refine every initial cell in this call, see
-    // PolytopeTree::cell_refinement_levels().
+    // to refine every owned initial cell in this call, see
+    // PolytopeTree::cell_refinement_levels(). The tree rank computes them.
     std::vector<int> remaining_levels;
     if (multiple && allow_refinement)
       {
         std::vector<double>       error_sq;
         std::vector<unsigned int> is_refined;
         initial_cell_data(cell_indicators, error_sq, is_refined);
-        remaining_levels = tree.cell_refinement_levels(error_sq, levels);
+        const std::vector<int> tree_levels =
+          tree.cell_refinement_levels(error_sq, levels);
+        const std::vector<double> owned_levels = to_p4est_ranks(
+          std::vector<double>(tree_levels.begin(), tree_levels.end()), 1);
+        remaining_levels.assign(owned_levels.begin(), owned_levels.end());
       }
 
     // Refinement flags. A cell is refined by p4est when it is a current
@@ -1190,7 +1644,7 @@ namespace dealii::PolytopeAdaptivity
           const unsigned int cell_index = cell->active_cell_index();
           const unsigned int initial    = initial_cell(cell);
           const bool         alone =
-            cell->level() > 0 || tree.current_polytope_size(initial) == 1;
+            cell->level() > 0 || tree_polytope_size[initial] == 1;
           const int n_levels =
             multiple ? levels(cell_indicators[cell_index]) : 0;
           const bool over_tolerance =
@@ -1350,6 +1804,7 @@ namespace dealii::PolytopeAdaptivity
                                          parameters.max_cells_per_polytope,
                                          allow_refinement,
                                          allow_coarsening);
+    tree_is_refined = is_refined;
     update_polytopes();
     return true;
   }
@@ -1397,89 +1852,97 @@ namespace dealii::PolytopeAdaptivity
 
 
   /**
-   * The ratio $|\partial P| / |P|$ of boundary measure to volume of every
-   * polytope that a locally owned polytope sees: its own and those of its
-   * neighbours on other ranks. It measures how thin a polytope is. The ratio
-   * of a polytope is stored in the entry of its first degree of freedom, so
-   * that the vector has the layout of a solution vector with the ghost entries
-   * of locally_relevant_polytope_dofs(): the ghost update of this vector
-   * brings the ratio of a neighbour on another rank, as the ghost update of a
-   * solution vector brings its coefficients.
+   * Initializes @p amg for @p matrix, the matrix of a discretization with
+   * the polynomials of @p ah on its polytopes: ML's algebraic multigrid by
+   * smoothed aggregation, to precondition the conjugate gradients.
    *
-   * A face of a cell lies on $\partial P$ if it is on the boundary of the
-   * domain or its neighbour is not a cell of $P$. A polytope of two or more
-   * cells consists of initial cells that are not refined, so a neighbour that
-   * is refined lies outside it. Measures are sums of quadrature weights:
-   * CellAccessor::measure() loses all digits on cells much smaller than their
-   * distance to the origin. Two Gauss points per direction integrate the
-   * Jacobian determinant of a multilinear cell or face exactly.
+   * The basis functions of a polytope are polynomials on its bounding box. On
+   * a polytope that fills only part of its box they are nearly linearly
+   * dependent there, so the diagonal block of the matrix that couples the
+   * degrees of freedom of one polytope is badly conditioned, the more so the
+   * higher the degree. A pointwise smoother cannot correct this. On the
+   * finest level the smoother is therefore block Jacobi with one block per
+   * polytope, which inverts each of these diagonal blocks exactly. The
+   * degrees of freedom of a polytope are numbered consecutively, so the
+   * blocks are consecutive ranges of rows of the same size. The rows of the
+   * coarser levels no longer belong to single polytopes, and these levels
+   * keep a Chebyshev smoother.
+   *
+   * The basis is modal, so the constant function is the first basis function
+   * of every polytope, not the sum of all of them. ML builds its coarse levels
+   * from the near-null space, so the degrees of freedom of a polytope form one
+   * node of ML ("PDE equations" = the degrees of freedom per polytope), and
+   * the near-null space is the single vector that is 1 on the first degree of
+   * freedom of every polytope and 0 elsewhere, i.e. the coefficient vector of
+   * the constant. With one equation per node ML would take the vector of all
+   * ones, and the coarse levels would not represent the smooth error. Without
+   * an explicit near-null space ML takes one vector per equation, one for each
+   * basis function; only the first of them is close to the kernel of the
+   * operator, and the others make every coarse level as many times larger as
+   * there are basis functions.
    */
   template <int dim>
-  TrilinosWrappers::MPI::Vector
-  shape_ratios(const AgglomerationHandler<dim> &ah)
+  void
+  initialize_polytope_amg(TrilinosWrappers::PreconditionAMG    &amg,
+                          const TrilinosWrappers::SparseMatrix &matrix,
+                          const AgglomerationHandler<dim>      &ah)
   {
-    const MPI_Comm  comm = ah.get_triangulation().get_mpi_communicator();
-    FE_Nothing<dim> fe_nothing;
-    FEValues<dim>   fe_values(ah.get_mapping(),
-                            fe_nothing,
-                            QGauss<dim>(2),
-                            update_JxW_values);
-    FEFaceValues<dim> fe_face_values(ah.get_mapping(),
-                                     fe_nothing,
-                                     QGauss<dim - 1>(2),
-                                     update_JxW_values);
-    TrilinosWrappers::MPI::Vector owned(ah.agglo_dh.locally_owned_dofs(), comm);
-    std::vector<types::global_dof_index> dof_indices(ah.get_fe().dofs_per_cell);
-    std::set<CellId>                     cells_of_polytope;
-    for (const auto &polytope : ah.polytope_iterators())
-      if (polytope->is_locally_owned())
-        {
-          cells_of_polytope.clear();
-          for (const auto &cell : polytope->get_agglomerate())
-            cells_of_polytope.insert(cell->id());
-          double volume = 0., boundary = 0.;
-          for (const auto &cell : polytope->get_agglomerate())
-            {
-              fe_values.reinit(cell);
-              for (const unsigned int q : fe_values.quadrature_point_indices())
-                volume += fe_values.JxW(q);
-              for (const unsigned int f : cell->face_indices())
-                if (cell->at_boundary(f) || cell->neighbor(f)->has_children() ||
-                    cells_of_polytope.count(cell->neighbor(f)->id()) == 0)
-                  {
-                    fe_face_values.reinit(cell, f);
-                    for (const unsigned int q :
-                         fe_face_values.quadrature_point_indices())
-                      boundary += fe_face_values.JxW(q);
-                  }
-            }
-          polytope->get_dof_indices(dof_indices);
-          owned(dof_indices[0]) = boundary / volume;
-        }
-    owned.compress(VectorOperation::insert);
-    TrilinosWrappers::MPI::Vector ratios(ah.agglo_dh.locally_owned_dofs(),
-                                         locally_relevant_polytope_dofs(ah),
-                                         comm);
-    ratios = owned;
-    return ratios;
+    Teuchos::ParameterList parameters;
+    ML_Epetra::SetDefaults("SA", parameters);
+    parameters.set("coarse: type", "Amesos-KLU");
+    parameters.set("coarse: max size", 2000);
+    parameters.set("initialize random seed", true);
+    parameters.set("prec type", "MGV");
+    parameters.set("cycle applications", 1);
+    parameters.set("aggregation: threshold", 0.02);
+    parameters.set("smoother: type", "Chebyshev");
+    parameters.set("smoother: Chebyshev alpha", 10.);
+    parameters.set("smoother: sweeps", 2);
+    parameters.set("ML output", 0);
+
+    // One block per locally owned polytope.
+    const auto         range = matrix.local_range();
+    const unsigned int n_local_rows =
+      static_cast<unsigned int>(range.second - range.first);
+    const unsigned int dofs_per_polytope = ah.get_fe().dofs_per_cell;
+    AssertThrow(n_local_rows % dofs_per_polytope == 0,
+                ExcMessage("The locally owned rows are not whole polytopes."));
+    parameters.set("PDE equations", static_cast<int>(dofs_per_polytope));
+    // The near-null space: the constant. ML reads it during initialize().
+    std::vector<double> constant_mode(n_local_rows, 0.);
+    for (unsigned int i = 0; i < n_local_rows; i += dofs_per_polytope)
+      constant_mode[i] = 1.;
+    parameters.set("null space: type", "pre-computed");
+    parameters.set("null space: dimension", 1);
+    parameters.set("null space: vectors", constant_mode.data());
+    Teuchos::ParameterList &finest =
+      parameters.sublist("smoother: list (level 0)");
+    finest.set("smoother: type", "IFPACK");
+    finest.set("smoother: ifpack type", "block relaxation stand-alone");
+    finest.set("smoother: sweeps", 1);
+    Teuchos::ParameterList &blocks = finest.sublist("smoother: ifpack list");
+    blocks.set("relaxation: type", "Jacobi");
+    blocks.set("relaxation: sweeps", 1);
+    blocks.set("partitioner: type", "linear");
+    blocks.set("partitioner: local parts",
+               static_cast<int>(n_local_rows / dofs_per_polytope));
+
+    amg.initialize(matrix, parameters);
   }
 
 
 
   /**
-   * The ratio $|\partial P| / |P|$ of @p polytope from the vector of
-   * shape_ratios(). The polytope is locally owned or a neighbour of a locally
-   * owned one.
+   * The length of the shortest side of @p box.
    */
-  template <int dim, typename PolytopeIterator>
+  template <int dim>
   double
-  shape_ratio(const AgglomerationHandler<dim>     &ah,
-              const TrilinosWrappers::MPI::Vector &ratios,
-              const PolytopeIterator              &polytope)
+  shortest_side(const BoundingBox<dim> &box)
   {
-    std::vector<types::global_dof_index> dof_indices(ah.get_fe().dofs_per_cell);
-    polytope->get_dof_indices(dof_indices);
-    return ratios(dof_indices[0]);
+    double side = box.side_length(0);
+    for (unsigned int d = 1; d < dim; ++d)
+      side = std::min(side, box.side_length(d));
+    return side;
   }
 
 
@@ -1487,59 +1950,41 @@ namespace dealii::PolytopeAdaptivity
   /**
    * The SIPG penalty on an interior face between polytopes $P$ and $P'$,
    * @f[
-   *   \sigma_F = C \max_{K \in \{P, P'\}}
-   *     \max\left( \frac{2\sqrt{d}}{h_K}, \frac{|\partial K|}{d\,|K|} \right),
+   *   \sigma_F = \frac{2 C}{\min(s_P, s_{P'})},
    * @f]
    * with $C$ = @p penalty_constant, which contains $(p+1)(p+d)$, and the
-   * ratios @p ratio and @p ratio_neighbor from shape_ratios(). This is the
-   * penalty of Cangiani, Dong and Georgoulis (2023, eq. 2.16) with the
-   * constant $\tau$ of the inverse trace inequality taken polytope by
-   * polytope: their $C_\mathrm{inv}/h_K = \tau_K (p+1)(p+d)/h_K$, and for a
-   * convex polytope the best $\tau_K/h_K$ is $1/r_K$, the inverse of the
-   * inscribed radius. Both arguments of the maximum stand for $1/r_K$.
-   * $2\sqrt{d}/h_K$ is its value on a square or a cube, and
-   * $|\partial K|/(d|K|)$ is a lower bound for every convex polytope
-   * (Sewell 2024, arXiv:2401.03593, Prop. 2: $1/r_K$ lies between
-   * $|\partial K|/(d|K|)$ and $|\partial K|/|K|$), equal to $1/r_K$ on a
-   * square or a cube. The second argument takes over on a long thin
-   * polytope: a strip of width $w$ has $|\partial K|/|K| \approx 2/w$
-   * however long it is, while $1/h_K$ falls with its length, and with
-   * $1/h_K$ alone the matrix is not positive definite. The ratio of the whole
-   * polytope, not of the face, is used because the long side of a strip is
-   * split into many short faces, one for each neighbour. Both sides of the
-   * face see the same value.
+   * shortest sides $s_P$, $s_{P'}$ of the bounding boxes @p box and
+   * @p box_neighbor of the two polytopes. This is the penalty of Cangiani,
+   * Dong and Georgoulis (2023, eq. 2.16), the larger of
+   * $C_\sigma C_\mathrm{inv}/h_K$ of the two sides, with
+   * $C_\mathrm{inv} = \tau (p+1)(p+d)$ of the inverse trace inequality (their
+   * Lemma 2.5), in which $\tau / h_K$ is replaced by $2 / s_P$. On a square or
+   * a cube $2 / s_P$ is the inverse of the radius of the inscribed ball, the
+   * value of $\tau / h_K$ with $\tau = 2\sqrt{d}$. On a thin polytope the
+   * diameter is set by the long side, and $\tau / h_K$ with a fixed $\tau$
+   * would be too small; $2 / s_P$ grows as the polytope gets thinner.
    */
   template <int dim>
   double
-  interior_penalty(const double penalty_constant,
-                   const double h,
-                   const double h_neighbor,
-                   const double ratio,
-                   const double ratio_neighbor)
+  interior_penalty(const double            penalty_constant,
+                   const BoundingBox<dim> &box,
+                   const BoundingBox<dim> &box_neighbor)
   {
-    return penalty_constant *
-           std::max(2. * std::sqrt(double(dim)) / std::min(h, h_neighbor),
-                    std::max(ratio, ratio_neighbor) / dim);
+    return 2. * penalty_constant /
+           std::min(shortest_side(box), shortest_side(box_neighbor));
   }
 
 
 
   /**
    * The SIPG penalty on a face of polytope $P$ on the boundary,
-   * @f[
-   *   \sigma_F = C \max\left( \frac{2\sqrt{d}}{h_P},
-   *     \frac{|\partial P|}{d\,|P|} \right),
-   * @f]
-   * the one of interior_penalty() with $P$ alone.
+   * $\sigma_F = 2 C / s_P$, the one of interior_penalty() with $P$ alone.
    */
   template <int dim>
   double
-  boundary_penalty(const double penalty_constant,
-                   const double h,
-                   const double ratio)
+  boundary_penalty(const double penalty_constant, const BoundingBox<dim> &box)
   {
-    return penalty_constant *
-           std::max(2. * std::sqrt(double(dim)) / h, ratio / dim);
+    return 2. * penalty_constant / shortest_side(box);
   }
 
 
@@ -1557,8 +2002,7 @@ namespace dealii::PolytopeAdaptivity
    * the full gradient jump comprising the normal and the tangential term of
    * the paper, with $u_h$ itself as the jump on the boundary. $\sigma_F$ is
    * the penalty of the assembly: interior_penalty() on an interior face and
-   * boundary_penalty() on the boundary, with the ratios of the polytopes from
-   * @p ratios (see shape_ratios()). The error indicators are stored on the
+   * boundary_penalty() on the boundary. The error indicators are stored on the
    * cells: each of the $n_P$ cells of $P$ gets $\eta_P / \sqrt{n_P}$, so
    * that the squares over the cells of $P$ sum to $\eta_P^2$.
    *
@@ -1578,7 +2022,7 @@ namespace dealii::PolytopeAdaptivity
    * @p solution must hold the degrees of freedom of the neighbours on other
    * ranks, see locally_relevant_polytope_dofs(). The handler's FEValues are
    * initialized here with values, gradients and second derivatives, on
-   * quadratures of $2p+2$ points per direction; on a face to another rank the
+   * quadratures of $p+1$ points per direction; on a face to another rank the
    * points are those its rank sent.
    */
   template <int dim>
@@ -1588,7 +2032,6 @@ namespace dealii::PolytopeAdaptivity
     const TrilinosWrappers::MPI::Vector &solution,
     const Function<dim>                 &rhs_function,
     const double                         penalty_constant,
-    const TrilinosWrappers::MPI::Vector &ratios,
     Vector<float>                       &cell_indicators,
     const std::function<
       double(const typename Triangulation<dim>::active_cell_iterator &,
@@ -1598,9 +2041,9 @@ namespace dealii::PolytopeAdaptivity
     const Triangulation<dim> &tria   = ah.get_triangulation();
     const unsigned int        degree = ah.get_fe().degree;
     const unsigned int        n_dofs = ah.get_fe().dofs_per_cell;
-    const unsigned int        n_q_1d = 2 * degree + 2;
+    const unsigned int        n_q_1d = degree + 1;
     // Values, gradients and second derivatives on the polytopes and their
-    // faces, with 2p+2 Gauss points per direction.
+    // faces, with p+1 Gauss points per direction.
     ah.initialize_fe_values(QGauss<dim>(n_q_1d),
                             update_values | update_gradients | update_hessians |
                               update_quadrature_points | update_JxW_values,
@@ -1683,10 +2126,9 @@ namespace dealii::PolytopeAdaptivity
                       tangential_sq(gradients_here[q], normals[q]) *
                       face_values.JxW(q);
                   }
-                const double sigma = boundary_penalty<dim>(
-                  penalty_constant,
-                  h,
-                  shape_ratio(ah, ratios, polytope));
+                const double sigma =
+                  boundary_penalty<dim>(penalty_constant,
+                                        polytope->get_bounding_box());
                 error_sq[polytope->index()] +=
                   sigma * value_sq + h * gradient_sq;
                 continue;
@@ -1771,12 +2213,10 @@ namespace dealii::PolytopeAdaptivity
                 gradient_sq += gradient_jump.norm_square() * weight;
                 value_sq += value_jump * value_jump * weight;
               }
-            const double sigma = interior_penalty<dim>(
-              penalty_constant,
-              h,
-              h_neighbor,
-              shape_ratio(ah, ratios, polytope),
-              shape_ratio(ah, ratios, neighbor));
+            const double sigma =
+              interior_penalty<dim>(penalty_constant,
+                                    polytope->get_bounding_box(),
+                                    neighbor->get_bounding_box());
             error_sq[polytope->index()] += h * gradient_sq + sigma * value_sq;
             if (!ghost)
               error_sq[neighbor->index()] +=

@@ -18,6 +18,7 @@
 #include <deal.II/base/config.h>
 
 #include <deal.II/base/bounding_box.h>
+#include <deal.II/base/function.h>
 #include <deal.II/base/point.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/tensor.h>
@@ -721,58 +722,44 @@ namespace dealii::QuadratureFree
                 ExcMessage("The first basis function is not constant."));
     basis.prefactor = std::pow(constant_value, -static_cast<double>(dim - 1));
 
-    // The exponents of every basis function: fit it in the monomials of
-    // degree p. Its exponent in direction d is the largest exponent of t_d in
-    // the fit.
-    {
-      const auto        &indices = multi_indices<dim>(degree);
-      const QGauss<dim>  points(degree + 2);
-      FullMatrix<double> vandermonde(points.size(), indices.size());
-      for (unsigned int q = 0; q < points.size(); ++q)
-        for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
-          {
-            double value = 1.;
-            for (unsigned int direction = 0; direction < dim; ++direction)
-              value *= std::pow(2. * points.point(q)[direction] - 1.,
-                                indices[monomial][direction]);
-            vandermonde(q, monomial) = value;
-          }
-      Householder<double> qr(vandermonde);
-      Vector<double>      samples(points.size()), fitted(indices.size());
-      basis.exponents.resize(basis.n_dofs);
-      for (unsigned int i = 0; i < basis.n_dofs; ++i)
-        {
-          for (unsigned int q = 0; q < points.size(); ++q)
-            samples[q] = fe.shape_value(i, points.point(q));
-          qr.least_squares(fitted, samples);
-          double largest = 0.;
-          for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
-            largest = std::max(largest, std::abs(fitted[monomial]));
-          basis.exponents[i].fill(0);
-          for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
-            if (std::abs(fitted[monomial]) > 1e-8 * largest)
-              for (unsigned int direction = 0; direction < dim; ++direction)
-                basis.exponents[i][direction] =
-                  std::max(basis.exponents[i][direction],
-                           indices[monomial][direction]);
-        }
-    }
-
-    // B_n by a fit along a line t_2 = ... = const of the function with
-    // exponents (n, 0, ..., 0): a fit of degree p, far better conditioned
-    // than reading B_n off the fit of degree 2p.
+    // Fit every basis function in the monomials of degree p. Its exponent in
+    // direction d is the largest exponent of t_d in the fit. The function
+    // with exponents (n, 0, ..., 0) is B_n(t_1), so its coefficients of
+    // t_1^m are those of B_n.
     basis.coefficients_1d.assign(degree + 1,
                                  std::vector<double>(degree + 1, 0.));
     std::vector<bool>  found(degree + 1, false);
-    const QGauss<1>    line(degree + 2);
-    FullMatrix<double> vandermonde(line.size(), degree + 1);
-    for (unsigned int q = 0; q < line.size(); ++q)
-      for (unsigned int power = 0; power <= degree; ++power)
-        vandermonde(q, power) = std::pow(2. * line.point(q)[0] - 1., power);
+    const auto        &indices = multi_indices<dim>(degree);
+    const QGauss<dim>  points(degree + 2);
+    FullMatrix<double> vandermonde(points.size(), indices.size());
+    for (unsigned int q = 0; q < points.size(); ++q)
+      for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
+        {
+          double value = 1.;
+          for (unsigned int direction = 0; direction < dim; ++direction)
+            value *= std::pow(2. * points.point(q)[direction] - 1.,
+                              indices[monomial][direction]);
+          vandermonde(q, monomial) = value;
+        }
     Householder<double> qr(vandermonde);
-    Vector<double>      samples(line.size()), fitted(degree + 1);
+    Vector<double>      samples(points.size()), fitted(indices.size());
+    basis.exponents.resize(basis.n_dofs);
     for (unsigned int i = 0; i < basis.n_dofs; ++i)
       {
+        for (unsigned int q = 0; q < points.size(); ++q)
+          samples[q] = fe.shape_value(i, points.point(q));
+        qr.least_squares(fitted, samples);
+        double largest = 0.;
+        for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
+          largest = std::max(largest, std::abs(fitted[monomial]));
+        basis.exponents[i].fill(0);
+        for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
+          if (std::abs(fitted[monomial]) > 1e-8 * largest)
+            for (unsigned int direction = 0; direction < dim; ++direction)
+              basis.exponents[i][direction] =
+                std::max(basis.exponents[i][direction],
+                         indices[monomial][direction]);
+
         bool along_first = true;
         for (unsigned int direction = 1; direction < dim; ++direction)
           along_first = along_first && basis.exponents[i][direction] == 0;
@@ -780,17 +767,18 @@ namespace dealii::QuadratureFree
           continue;
         const unsigned int index_1d = basis.exponents[i][0];
         found[index_1d]             = true;
-        for (unsigned int q = 0; q < line.size(); ++q)
-          {
-            Point<dim> point = check_point_a;
-            point[0]         = line.point(q)[0];
-            samples[q]       = fe.shape_value(i, point);
-          }
-        qr.least_squares(fitted, samples);
         // B_n has degree n: the fitted coefficients of higher powers are
-        // round-off, and are dropped so that the face terms can skip them.
-        for (unsigned int power = 0; power <= index_1d; ++power)
-          basis.coefficients_1d[index_1d][power] = fitted[power];
+        // round-off, and are left at zero so that the face terms can skip
+        // them.
+        for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
+          {
+            bool on_first_axis = true;
+            for (unsigned int direction = 1; direction < dim; ++direction)
+              on_first_axis = on_first_axis && indices[monomial][direction] == 0;
+            if (on_first_axis && indices[monomial][0] <= index_1d)
+              basis.coefficients_1d[index_1d][indices[monomial][0]] =
+                fitted[monomial];
+          }
       }
     for (unsigned int index_1d = 0; index_1d <= degree; ++index_1d)
       AssertThrow(found[index_1d],
@@ -1413,6 +1401,156 @@ namespace dealii::QuadratureFree
 
 
   /**
+   * A polynomial $f(x) = \sum_k a_k x^{\beta_k}$ in the coordinates $x$ of
+   * the mesh. As a right-hand side it is integrated against the basis
+   * without quadrature (PolytopeIntegrator::volume_matrices()), and as a
+   * Function it gives its values to an assembly by quadrature.
+   */
+  template <int dim>
+  class PolynomialFunction : public Function<dim>
+  {
+  public:
+    /**
+     * Constructor. The k-th term is @p coefficients[k] times the monomial
+     * with the exponents @p exponents[k].
+     */
+    PolynomialFunction(
+      const std::vector<std::array<unsigned int, dim>> &exponents,
+      const std::vector<double>                        &coefficients);
+
+    double
+    value(const Point<dim> &x, const unsigned int component = 0) const override;
+
+    /**
+     * The total degree of the polynomial.
+     */
+    unsigned int
+    degree() const;
+
+    /**
+     * The coefficients of the polynomial in the centred coordinates $t$ of
+     * @p box, $x = c + \frac{h}{2} t$ with $c$ the centre and $h$ the side
+     * lengths of the box, one per multi-index of multi_indices() up to
+     * degree().
+     */
+    std::vector<double>
+    coefficients_in_box(const BoundingBox<dim> &box) const;
+
+  private:
+    /**
+     * The exponents of the terms.
+     */
+    const std::vector<std::array<unsigned int, dim>> exponents;
+
+    /**
+     * The coefficients of the terms.
+     */
+    const std::vector<double> coefficients;
+  };
+
+
+
+  template <int dim>
+  PolynomialFunction<dim>::PolynomialFunction(
+    const std::vector<std::array<unsigned int, dim>> &exponents,
+    const std::vector<double>                        &coefficients)
+    : exponents(exponents)
+    , coefficients(coefficients)
+  {
+    AssertDimension(exponents.size(), coefficients.size());
+  }
+
+
+
+  template <int dim>
+  double
+  PolynomialFunction<dim>::value(const Point<dim> &x,
+                                 const unsigned int /*component*/) const
+  {
+    double value = 0.;
+    for (unsigned int k = 0; k < coefficients.size(); ++k)
+      {
+        double term = coefficients[k];
+        for (unsigned int direction = 0; direction < dim; ++direction)
+          term *= std::pow(x[direction], exponents[k][direction]);
+        value += term;
+      }
+    return value;
+  }
+
+
+
+  template <int dim>
+  unsigned int
+  PolynomialFunction<dim>::degree() const
+  {
+    unsigned int degree = 0;
+    for (const auto &exponent : exponents)
+      {
+        unsigned int sum = 0;
+        for (unsigned int direction = 0; direction < dim; ++direction)
+          sum += exponent[direction];
+        degree = std::max(degree, sum);
+      }
+    return degree;
+  }
+
+
+
+  template <int dim>
+  std::vector<double>
+  PolynomialFunction<dim>::coefficients_in_box(const BoundingBox<dim> &box) const
+  {
+    // Each term is a product over the directions of x_d^b = (c_d + h_d/2
+    // t_d)^b, and each factor is rewritten in t_d alone.
+    const auto &indices = multi_indices<dim>(degree());
+    std::map<std::array<unsigned int, dim>, unsigned int> index_of;
+    for (unsigned int alpha = 0; alpha < indices.size(); ++alpha)
+      index_of[indices[alpha]] = alpha;
+    const Point<dim> centre = box.center();
+
+    std::vector<double> result(indices.size(), 0.);
+    for (unsigned int k = 0; k < coefficients.size(); ++k)
+      {
+        // factors[d][j] is the coefficient of t_d^j in x_d^b.
+        std::array<std::vector<double>, dim> factors;
+        for (unsigned int direction = 0; direction < dim; ++direction)
+          {
+            const unsigned int  b = exponents[k][direction];
+            std::vector<double> power(b + 1, 0.);
+            power[b] = 1.;
+            factors[direction].resize(b + 1);
+            internal::substitute_affine(power.data(),
+                                        b,
+                                        0.5 * box.side_length(direction),
+                                        centre[direction],
+                                        factors[direction].data());
+          }
+        // The product of the factors, one multi-index at a time.
+        std::array<unsigned int, dim> index;
+        index.fill(0);
+        const auto multiply = [&](const auto        &self,
+                                  const unsigned int direction,
+                                  const double       product) -> void {
+          if (direction == dim)
+            {
+              result[index_of.at(index)] += coefficients[k] * product;
+              return;
+            }
+          for (unsigned int j = 0; j < factors[direction].size(); ++j)
+            {
+              index[direction] = j;
+              self(self, direction + 1, product * factors[direction][j]);
+            }
+        };
+        multiply(multiply, 0, 1.);
+      }
+    return result;
+  }
+
+
+
+  /**
    * Quadrature-free assembly for FE_AggloDGP of one degree on the polytopes
    * of an AgglomerationHandler.
    */
@@ -1434,11 +1572,21 @@ namespace dealii::QuadratureFree
      * polytope->index(), and, if @p mass is given and the integrator was
      * built with the mass, their mass matrices. All polytopes are done by one
      * matrix-matrix product of the fitted coefficients and the moments.
+     *
+     * If @p right_hand_side and @p load are given, @p load receives the load
+     * vectors $\int_P f \phi_i$ of the polynomial $f$ = @p right_hand_side,
+     * indexed in the same way. In the centred coordinates of the bounding box
+     * of $P$, $f \phi_i$ is a polynomial whose integral is a combination of
+     * the moments up to degree $p + q$, $q$ the degree of $f$, so the load
+     * vectors need no quadrature either.
      */
     void
-    volume_matrices(const AgglomerationHandler<dim> &ah,
-                    std::vector<FullMatrix<double>> &stiffness,
-                    std::vector<FullMatrix<double>> *mass = nullptr) const;
+    volume_matrices(
+      const AgglomerationHandler<dim>  &ah,
+      std::vector<FullMatrix<double>>  &stiffness,
+      std::vector<FullMatrix<double>>  *mass            = nullptr,
+      const PolynomialFunction<dim>    *right_hand_side = nullptr,
+      std::vector<Vector<double>>      *load            = nullptr) const;
 
     /**
      * The face matrices (see interface_matrices()) on face @p f of
@@ -1485,6 +1633,12 @@ namespace dealii::QuadratureFree
      * The coefficients of the mass matrix, one row per pair (i, j).
      */
     FullMatrix<double> mass_coefficients;
+
+    /**
+     * The coefficients of the basis functions themselves, one row per basis
+     * function and one column per monomial of degree up to $p$.
+     */
+    FullMatrix<double> integral_coefficients;
   };
 
 
@@ -1529,6 +1683,23 @@ namespace dealii::QuadratureFree
               mass_coefficients(i * n_dofs + j, monomial) =
                 fitted[i][j][monomial];
       }
+
+    // A basis function is the product c_0^{-(d-1)} B_{i_1}(t_1) ...
+    // B_{i_d}(t_d) of the separable form, so the coefficient of the monomial
+    // t^alpha is c_0^{-(d-1)} times the coefficient of t_k^{alpha_k} in
+    // B_{i_k}, multiplied over the directions k.
+    const auto &indices = multi_indices<dim>(degree);
+    integral_coefficients.reinit(n_dofs, indices.size());
+    for (unsigned int i = 0; i < n_dofs; ++i)
+      for (unsigned int monomial = 0; monomial < indices.size(); ++monomial)
+        {
+          double coefficient = separable.prefactor;
+          for (unsigned int direction = 0; direction < dim; ++direction)
+            coefficient *=
+              separable.coefficients_1d[separable.exponents[i][direction]]
+                                       [indices[monomial][direction]];
+          integral_coefficients(i, monomial) = coefficient;
+        }
   }
 
 
@@ -1538,17 +1709,26 @@ namespace dealii::QuadratureFree
   PolytopeIntegrator<dim>::volume_matrices(
     const AgglomerationHandler<dim> &ah,
     std::vector<FullMatrix<double>> &stiffness,
-    std::vector<FullMatrix<double>> *mass) const
+    std::vector<FullMatrix<double>> *mass,
+    const PolynomialFunction<dim>   *right_hand_side,
+    std::vector<Vector<double>>     *load) const
   {
+    Assert((right_hand_side == nullptr) == (load == nullptr),
+           ExcMessage("The load vectors need both the right-hand side and "
+                      "the vectors to fill."));
     Assert(mass == nullptr || mass_expansion,
            ExcMessage("The integrator was built without the mass."));
     const unsigned int n_dofs       = separable.n_dofs;
     const unsigned int n_monomials  = stiffness_expansion.n_monomials();
     const bool         compute_mass = mass != nullptr;
-    // The mass needs the moments up to degree 2p; the stiffness uses the
-    // first of them, up to degree 2p - 2 (multi_indices() orders by degree).
-    const unsigned int moment_degree =
+    // The mass needs the moments up to degree 2p, the load vectors up to
+    // degree p + q, and the stiffness up to degree 2p - 2. Each uses the
+    // first of the same moments (multi_indices() orders by degree).
+    unsigned int moment_degree =
       compute_mass ? 2 * degree : (degree >= 1 ? 2 * degree - 2 : 0);
+    if (load != nullptr)
+      moment_degree =
+        std::max(moment_degree, degree + right_hand_side->degree());
     const auto &boxes = ah.get_local_bboxes();
 
     // The moments of every locally owned polytope.
@@ -1614,6 +1794,58 @@ namespace dealii::QuadratureFree
             for (unsigned int i = 0; i < n_dofs; ++i)
               for (unsigned int j = 0; j < n_dofs; ++j)
                 matrix(i, j) = products(i * n_dofs + j, column);
+          }
+      }
+
+    if (load != nullptr)
+      {
+        // With the coefficients f_gamma of f in the coordinates t of P,
+        // int_P f phi_i = |B| sum_alpha C_{i alpha} sum_gamma f_gamma
+        // m_{alpha + gamma}. The inner sum is formed for every polytope, and
+        // all polytopes are then one matrix-matrix product with C.
+        const auto &basis_indices = multi_indices<dim>(degree);
+        const auto &f_indices = multi_indices<dim>(right_hand_side->degree());
+        const auto &moment_indices = multi_indices<dim>(moment_degree);
+        std::map<std::array<unsigned int, dim>, unsigned int> index_of;
+        for (unsigned int k = 0; k < moment_indices.size(); ++k)
+          index_of[moment_indices[k]] = k;
+        // sum_index[alpha][gamma] is the index of alpha + gamma.
+        std::vector<std::vector<unsigned int>> sum_index(
+          basis_indices.size(), std::vector<unsigned int>(f_indices.size()));
+        for (unsigned int alpha = 0; alpha < basis_indices.size(); ++alpha)
+          for (unsigned int gamma = 0; gamma < f_indices.size(); ++gamma)
+            {
+              std::array<unsigned int, dim> sum;
+              for (unsigned int direction = 0; direction < dim; ++direction)
+                sum[direction] =
+                  basis_indices[alpha][direction] + f_indices[gamma][direction];
+              sum_index[alpha][gamma] = index_of.at(sum);
+            }
+
+        FullMatrix<double> weighted_moments(basis_indices.size(), n_polytopes);
+        for (unsigned int column = 0; column < n_polytopes; ++column)
+          {
+            const BoundingBox<dim> &box = boxes[polytope_index[column]];
+            const std::vector<double> f_coefficients =
+              right_hand_side->coefficients_in_box(box);
+            for (unsigned int alpha = 0; alpha < basis_indices.size(); ++alpha)
+              {
+                double sum = 0.;
+                for (unsigned int gamma = 0; gamma < f_indices.size(); ++gamma)
+                  sum += f_coefficients[gamma] *
+                         moments[column][sum_index[alpha][gamma]];
+                weighted_moments(alpha, column) = sum * box.volume();
+              }
+          }
+        products.reinit(n_dofs, n_polytopes);
+        integral_coefficients.mmult(products, weighted_moments);
+        load->resize(size);
+        for (unsigned int column = 0; column < n_polytopes; ++column)
+          {
+            Vector<double> &vector = (*load)[polytope_index[column]];
+            vector.reinit(n_dofs);
+            for (unsigned int i = 0; i < n_dofs; ++i)
+              vector(i) = products(i, column);
           }
       }
   }

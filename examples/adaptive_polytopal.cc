@@ -14,17 +14,26 @@
 // The complete adaptive pipeline on polytopes, configured by a parameter
 // file (default: adaptive_polytopal.prm):
 // - adaptive refinement and coarsening of polytopes along fixed R-trees,
-//   against a tolerance, one level or several per adaptation
+//   against a tolerance, one level or several per adaptation, the trees
+//   built over the initial cells of the ranks of p4est or of METIS
 //   (PolytopeAdaptivity);
 // - assembly with or without quadrature (QuadratureFree);
-// - solving on the p4est mesh or on a copy partitioned by ParMETIS on the
-//   graph of the polytopes (PolytopeRepartition);
+// - solving on the p4est mesh or on a copy on which every polytope lies on
+//   one rank, partitioned by ParMETIS on the graph of the polytopes or by
+//   the ranks of the R-trees (PolytopeRepartition);
 // - for the heat equation, adaptive time stepping by Algorithm 1 of
 //   Cangiani, Georgoulis and Metcalfe (TimeAdaptivity).
 //
-// Two problems on the unit square, both with u = 0 on the boundary: the
-// Poisson problem with the point singularity u = sin(pi x) sin(pi y) r^(2/3),
-// and the heat equation with a moving Gaussian peak.
+// Four problems on the unit square or, with Dimension = 3, the unit cube,
+// all with u = 0 on the boundary: the Poisson problem with the point
+// singularity u = sin(pi x) sin(pi y) r^(2/3) (times sin(pi z) on the cube),
+// the Poisson problem with the constant source f = 1, the Poisson problem with
+// the polynomial solution u = x(1 - x) y(1 - y)(1 + x + 2 y^2) (times z(1 - z)
+// on the cube), and the heat equation with a moving Gaussian peak. The load vector of the
+// two polynomial right-hand sides needs no quadrature either. The two Poisson
+// problems without an exact polynomial solution also run on an unstructured
+// mesh read from a gmsh file, of a rectangle to which the window of the point
+// singularity is fitted.
 
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/function.h>
@@ -36,6 +45,8 @@
 #include <deal.II/distributed/tria.h>
 
 #include <deal.II/grid/grid_generator.h>
+#include <deal.II/grid/grid_in.h>
+#include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/grid_tools_cache.h>
 
 #include <deal.II/lac/solver_cg.h>
@@ -60,6 +71,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 
 using namespace dealii;
 
@@ -74,33 +86,42 @@ public:
   ProblemParameters();
 
   /**
-   * The problem, the initial mesh and the degree. See the descriptions in
-   * the constructor, which also appear in the parameter file.
+   * The dimension, the problem, the initial mesh and the degree. See the
+   * descriptions in the constructor, which also appear in the parameter file.
    */
+  unsigned int dimension      = 2;
   std::string  problem        = "singular";
-  unsigned int n_subdivisions = 64;
+  unsigned int n_subdivisions = 256;
   unsigned int degree         = 4;
+
+  /**
+   * An initial mesh read from a gmsh file instead, refined globally.
+   */
+  std::string  mesh_file;
+  unsigned int n_mesh_file_refinements = 0;
 
   /**
    * The adaptivity of the polytopes.
    */
-  unsigned int max_cells_per_polytope = 64;
+  unsigned int max_cells_per_polytope = 256;
   std::string  level_rule             = "multiple";
   double       coarsening_fraction    = 0.02;
   double       tolerance              = 5e-5;
   unsigned int n_cycles               = 20;
+  std::string  initial_partition      = "p4est";
 
   /**
    * The assembly without quadrature and the solution on a partitioned copy.
    */
   bool quadrature_free = false;
   bool repartition     = false;
+  bool use_parmetis    = true;
 
   /**
    * The time stepping of the heat equation.
    */
   unsigned int n_peaks_per_direction      = 1;
-  double       final_time                 = 0.2;
+  double       final_time                 = 0.6;
   double       initial_dt                 = 0.02;
   double       max_dt                     = 0.02;
   double       space_tolerance            = 2.5e-3;
@@ -117,14 +138,34 @@ ProblemParameters::ProblemParameters()
 {
   enter_subsection("Problem");
   {
+    add_parameter("Dimension",
+                  dimension,
+                  "2: the unit square. 3: the unit cube.",
+                  this->prm,
+                  Patterns::Integer(2, 3));
     add_parameter("Problem",
                   problem,
                   "'singular': the Poisson problem with a point singularity. "
-                  "'heat': the heat equation with a moving peak.");
+                  "'constant': the Poisson problem with f = 1, which has no "
+                  "exact solution to compare with. 'polynomial': the Poisson "
+                  "problem with u = x(1 - x) y(1 - y)(1 + x + 2 y^2), times "
+                  "z(1 - z) on the unit cube. 'heat': the heat equation with "
+                  "a moving peak.");
     add_parameter("Number of subdivisions",
                   n_subdivisions,
-                  "The initial mesh divides the unit square into this many "
-                  "cells per direction.");
+                  "The initial mesh divides the unit square or cube into "
+                  "this many cells per direction.");
+    add_parameter("Mesh file",
+                  mesh_file,
+                  "If not empty, a two-dimensional gmsh file whose mesh, "
+                  "refined globally, is the initial mesh instead of the unit "
+                  "square, for 'singular' and 'constant'. Its domain must be "
+                  "a rectangle: the window of the point singularity is fitted "
+                  "to it, and the singular point is the vertex of the file "
+                  "nearest its centre.");
+    add_parameter("Mesh file refinements",
+                  n_mesh_file_refinements,
+                  "The global refinements of the mesh file.");
     add_parameter("Degree", degree, "The polynomial degree of the elements.");
   }
   leave_subsection();
@@ -151,6 +192,12 @@ ProblemParameters::ProblemParameters()
                   n_cycles,
                   "The largest number of adaptive cycles of the Poisson "
                   "problem.");
+    add_parameter("Initial partition",
+                  initial_partition,
+                  "Which rank builds the R-tree over an initial cell. "
+                  "'p4est': the rank that owns it on the p4est mesh. "
+                  "'metis': the rank METIS assigns it to; on more than one "
+                  "rank this requires solving on a partitioned copy.");
   }
   leave_subsection();
   enter_subsection("Quadrature-free integration");
@@ -164,8 +211,13 @@ ProblemParameters::ProblemParameters()
   {
     add_parameter("Solve on a partitioned copy",
                   repartition,
-                  "Solve on a copy of the mesh partitioned by ParMETIS on the "
-                  "graph of the polytopes.");
+                  "Solve on a copy of the mesh on which every polytope lies "
+                  "on one rank.");
+    add_parameter("Partition the copy by ParMETIS",
+                  use_parmetis,
+                  "Partition the copy by ParMETIS on the graph of the "
+                  "polytopes. Otherwise every polytope goes to the rank whose "
+                  "R-tree holds its initial cells.");
   }
   leave_subsection();
   enter_subsection("Time stepping");
@@ -208,12 +260,25 @@ ProblemParameters::ProblemParameters()
 
 /**
  * $u = \sin(\pi x)\sin(\pi y) r^{2/3}$, $r$ the distance to the centre of
- * the square.
+ * the square. On a rectangle $[a, b]$ other than the unit square the window
+ * is $\prod_d \sin(\pi (x_d - a_d)/(b_d - a_d))$, which vanishes on its
+ * boundary, and $r$ is the distance to a given singular point.
  */
 template <int dim>
 class SingularSolution : public Function<dim>
 {
 public:
+  /**
+   * The unit square or cube, with the singular point at its centre.
+   */
+  SingularSolution();
+
+  /**
+   * The rectangle @p domain, with the singular point @p singular_point.
+   */
+  SingularSolution(const BoundingBox<dim> &domain,
+                   const Point<dim>       &singular_point);
+
   virtual double
   value(const Point<dim> &p, const unsigned int component = 0) const override;
 
@@ -225,7 +290,39 @@ public:
 
 private:
   static constexpr double alpha = 2. / 3.;
+
+  /**
+   * The lower corner of the rectangle, the wave number $\pi/(b_d - a_d)$ of
+   * the window in each direction, and the singular point.
+   */
+  Point<dim>     lower_corner;
+  Tensor<1, dim> wave_number;
+  Point<dim>     singular_point;
 };
+
+
+
+template <int dim>
+SingularSolution<dim>::SingularSolution()
+{
+  for (unsigned int direction = 0; direction < dim; ++direction)
+    {
+      wave_number[direction]    = numbers::PI;
+      singular_point[direction] = 0.5;
+    }
+}
+
+
+
+template <int dim>
+SingularSolution<dim>::SingularSolution(const BoundingBox<dim> &domain,
+                                        const Point<dim>       &singular_point)
+  : lower_corner(domain.get_boundary_points().first)
+  , singular_point(singular_point)
+{
+  for (unsigned int direction = 0; direction < dim; ++direction)
+    wave_number[direction] = numbers::PI / domain.side_length(direction);
+}
 
 
 
@@ -236,25 +333,26 @@ SingularSolution<dim>::evaluate(const Point<dim> &p,
                                 double           &laplacian) const
 {
   // The window sin(pi x) sin(pi y), which vanishes on the boundary.
+  Tensor<1, dim> phase;
+  for (unsigned int direction = 0; direction < dim; ++direction)
+    phase[direction] =
+      wave_number[direction] * (p[direction] - lower_corner[direction]);
   double window = 1.;
   for (unsigned int direction = 0; direction < dim; ++direction)
-    window *= std::sin(numbers::PI * p[direction]);
+    window *= std::sin(phase[direction]);
   Tensor<1, dim> grad_window;
   for (unsigned int direction = 0; direction < dim; ++direction)
     {
       grad_window[direction] =
-        numbers::PI * std::cos(numbers::PI * p[direction]);
+        wave_number[direction] * std::cos(phase[direction]);
       for (unsigned int other_direction = 0; other_direction < dim;
            ++other_direction)
         if (other_direction != direction)
-          grad_window[direction] *= std::sin(numbers::PI * p[other_direction]);
+          grad_window[direction] *= std::sin(phase[other_direction]);
     }
-  const double laplacian_window = -dim * numbers::PI * numbers::PI * window;
+  const double laplacian_window = -wave_number.norm_square() * window;
 
-  Point<dim> centre;
-  for (unsigned int direction = 0; direction < dim; ++direction)
-    centre[direction] = 0.5;
-  const Tensor<1, dim> offset = p - centre;
+  const Tensor<1, dim> offset = p - singular_point;
   const double         r_sq   = offset.norm_square();
   // The singular point itself: u vanishes there, and the Laplacian, which
   // is infinite, is set to zero. No quadrature point lies on it, since it
@@ -294,6 +392,11 @@ template <int dim>
 class SingularSource : public Function<dim>
 {
 public:
+  /**
+   * The source of @p solution.
+   */
+  SingularSource(const SingularSolution<dim> &solution);
+
   virtual double
   value(const Point<dim> &p, const unsigned int component = 0) const override;
 
@@ -304,12 +407,82 @@ private:
 
 
 template <int dim>
+SingularSource<dim>::SingularSource(const SingularSolution<dim> &solution)
+  : solution(solution)
+{}
+
+
+
+template <int dim>
 double
 SingularSource<dim>::value(const Point<dim> &p, const unsigned int) const
 {
   double u, laplacian;
   solution.evaluate(p, u, laplacian);
   return -laplacian;
+}
+
+
+
+/**
+ * $u = x(1-x)\,y(1-y)(1 + x + 2y^2)$ on the unit square, times $z(1-z)$ on the
+ * unit cube, or its right-hand side $f = -\Delta u$ if @p right_hand_side, as
+ * sums of monomials. Both are polynomials, so that quadrature-free
+ * integration also assembles the load vector.
+ */
+template <int dim>
+QuadratureFree::PolynomialFunction<dim>
+polynomial_function(const bool right_hand_side)
+{
+  // The terms a x^i y^j of u and of f on the square.
+  using Exponents = std::vector<std::pair<unsigned int, unsigned int>>;
+  const Exponents solution_exponents = {
+    {1, 1}, {1, 2}, {1, 3}, {1, 4}, {2, 3}, {2, 4}, {3, 1}, {3, 2}};
+  const std::vector<double> solution_coefficients = {
+    1., -1., 2., -2., -2., 2., -1., 1.};
+  const Exponents source_exponents = {
+    {0, 3}, {0, 4}, {1, 0}, {1, 1}, {1, 2}, {2, 1}, {2, 2}, {3, 0}};
+  const std::vector<double> source_coefficients = {
+    4., -4., 2., -6., 18., 12., -24., -2.};
+
+  std::vector<std::array<unsigned int, dim>> exponents;
+  std::vector<double>                        coefficients;
+  const auto add_terms = [&](const Exponents           &exponents_2d,
+                             const std::vector<double> &coefficients_2d,
+                             const unsigned int         z_exponent,
+                             const double               factor) {
+    for (unsigned int i = 0; i < exponents_2d.size(); ++i)
+      {
+        std::array<unsigned int, dim> exponent{};
+        exponent[0] = exponents_2d[i].first;
+        exponent[1] = exponents_2d[i].second;
+        if constexpr (dim == 3)
+          exponent[2] = z_exponent;
+        exponents.push_back(exponent);
+        coefficients.push_back(factor * coefficients_2d[i]);
+      }
+  };
+
+  if constexpr (dim == 2)
+    {
+      if (right_hand_side)
+        add_terms(source_exponents, source_coefficients, 0, 1.);
+      else
+        add_terms(solution_exponents, solution_coefficients, 0, 1.);
+    }
+  else
+    {
+      // On the cube u_3 = u_2 z(1 - z), so f_3 = f_2 z(1 - z) + 2 u_2.
+      const auto &exponents_2d =
+        right_hand_side ? source_exponents : solution_exponents;
+      const auto &coefficients_2d =
+        right_hand_side ? source_coefficients : solution_coefficients;
+      add_terms(exponents_2d, coefficients_2d, 1, 1.);
+      add_terms(exponents_2d, coefficients_2d, 2, -1.);
+      if (right_hand_side)
+        add_terms(solution_exponents, solution_coefficients, 0, 2.);
+    }
+  return QuadratureFree::PolynomialFunction<dim>(exponents, coefficients);
 }
 
 
@@ -608,7 +781,8 @@ public:
 
 private:
   /**
-   * The adaptive cycles of the Poisson problem.
+   * The adaptive cycles of the Poisson problem, with the point singularity
+   * or with f = 1.
    */
   void
   run_poisson();
@@ -621,7 +795,8 @@ private:
 
   /**
    * The initial mesh, the unit square divided into the given number of cells
-   * per direction, and the polytopes at the start.
+   * per direction or the refined mesh of the file, and the polytopes at the
+   * start.
    */
   void
   make_fine_grid();
@@ -693,11 +868,18 @@ private:
   ConditionalOStream pcout;
 
   /**
-   * The p4est triangulation. It is never repartitioned, so that every polytope
-   * stays on one rank, and CellPolynomialTransfer finds the data of every cell
-   * on its rank.
+   * The p4est triangulation. It is never repartitioned, so that every cell
+   * keeps its rank, as AdaptivePolytopalMesh requires, and
+   * CellPolynomialTransfer finds the data of every cell on its rank.
    */
   parallel::distributed::Triangulation<dim> tria;
+
+  /**
+   * For a mesh read from a file: the bounding box of the domain and the
+   * singular point of the point singularity.
+   */
+  BoundingBox<dim> domain;
+  Point<dim>       singular_point;
 
   /**
    * The mapping of the cells, for GridTools::Cache.
@@ -711,8 +893,10 @@ private:
 
   /**
    * The penalty constant of the SIPG form, $C_\sigma (p + 1)(p + d)$ with
-   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square at $p = 4$ is
-   * $40/h$.
+   * $C_\sigma = \sqrt{2}/3$, so that the penalty of a square of side $s$ at
+   * $p = 4$ is $20\sqrt{2}/s$. On the polytopes that the R-trees in the rank
+   * regions of METIS form, this is about 1.5 times the smallest constant that
+   * keeps their diagonal blocks positive definite.
    */
   const double penalty_constant;
 
@@ -757,12 +941,6 @@ private:
    * other ranks, see PolytopeAdaptivity::locally_relevant_polytope_dofs().
    */
   TrilinosWrappers::MPI::Vector locally_relevant_solution;
-
-  /**
-   * The ratios of boundary measure to volume of the polytopes, for the
-   * penalty, see PolytopeAdaptivity::shape_ratios().
-   */
-  TrilinosWrappers::MPI::Vector ratios;
 
   /**
    * The solution of the last accepted step and its discrete elliptic
@@ -855,6 +1033,20 @@ AdaptivePolytopalProblem<dim>::AdaptivePolytopalProblem(
         data.level_rule = (parameters.level_rule == "multiple") ?
                             PolytopeAdaptivity::LevelRule::multiple_levels :
                             PolytopeAdaptivity::LevelRule::single_level;
+        AssertThrow(parameters.initial_partition == "p4est" ||
+                      parameters.initial_partition == "metis",
+                    ExcMessage("The initial partition is 'p4est' or "
+                               "'metis'."));
+        AssertThrow(parameters.initial_partition == "p4est" ||
+                      parameters.repartition ||
+                      Utilities::MPI::n_mpi_processes(communicator) == 1,
+                    ExcMessage("With the initial partition 'metis' a "
+                               "polytope may lie on several ranks of the "
+                               "p4est mesh, so the system must be solved on "
+                               "a partitioned copy."));
+        data.initial_partition = (parameters.initial_partition == "metis") ?
+                                   PolytopeAdaptivity::InitialPartition::metis :
+                                   PolytopeAdaptivity::InitialPartition::p4est;
         return data;
       }())
   , partitioned_copy(tria)
@@ -867,8 +1059,18 @@ AdaptivePolytopalProblem<dim>::AdaptivePolytopalProblem(
   , polytope_tolerance(-1.)
   , time(0.)
 {
-  AssertThrow(parameters.problem == "singular" || parameters.problem == "heat",
-              ExcMessage("The problem is 'singular' or 'heat'."));
+  AssertThrow(parameters.problem == "singular" ||
+                parameters.problem == "constant" ||
+                parameters.problem == "polynomial" ||
+                parameters.problem == "heat",
+              ExcMessage(
+                "The problem is 'singular', 'constant', 'polynomial' or "
+                "'heat'."));
+  AssertThrow(parameters.mesh_file.empty() ||
+                (dim == 2 && (parameters.problem == "singular" ||
+                              parameters.problem == "constant")),
+              ExcMessage("A mesh file is read only in two dimensions, for "
+                         "'singular' and 'constant'."));
   if (parameters.quadrature_free)
     integrator = std::make_unique<QuadratureFree::PolytopeIntegrator<dim>>(
       fe_dg, parameters.problem == "heat");
@@ -880,7 +1082,33 @@ template <int dim>
 void
 AdaptivePolytopalProblem<dim>::make_fine_grid()
 {
-  GridGenerator::subdivided_hyper_cube(tria, parameters.n_subdivisions, 0., 1.);
+  if (parameters.mesh_file.empty())
+    GridGenerator::subdivided_hyper_cube(tria,
+                                         parameters.n_subdivisions,
+                                         0.,
+                                         1.);
+  else
+    {
+      // The initial cells are the coarse cells of the p4est triangulation,
+      // so the refined mesh of the file is flattened to its active cells.
+      Triangulation<dim> file_tria;
+      GridIn<dim>        grid_in(file_tria);
+      std::ifstream      file(parameters.mesh_file);
+      AssertThrow(file, ExcFileNotOpen(parameters.mesh_file));
+      grid_in.read_msh(file);
+      domain = GridTools::compute_bounding_box(file_tria);
+      // The singular point is the vertex of the file nearest the centre of
+      // the domain, so that no quadrature point lies on it and it stays a
+      // vertex under refinement.
+      singular_point = file_tria.get_vertices()[GridTools::find_closest_vertex(
+        file_tria, domain.center())];
+      file_tria.refine_global(parameters.n_mesh_file_refinements);
+      GridGenerator::flatten_triangulation(file_tria, tria);
+      pcout << "mesh " << parameters.mesh_file << ": " << tria.n_global_active_cells()
+            << " initial cells in [" << domain.get_boundary_points().first
+            << "] x [" << domain.get_boundary_points().second
+            << "], singular point " << singular_point << std::endl;
+    }
   polytopal_mesh.initialize();
 }
 
@@ -895,7 +1123,12 @@ AdaptivePolytopalProblem<dim>::setup_agglomerated_problem()
   if (parameters.repartition)
     {
       partitioned_copy.reinit(polytopal_mesh.get_polytopes(),
-                              fe_dg.n_dofs_per_cell());
+                              polytopal_mesh.get_polytope_indices(),
+                              polytopal_mesh.get_polytope_index_offsets(),
+                              fe_dg.n_dofs_per_cell(),
+                              parameters.use_parmetis ?
+                                std::vector<unsigned int>() :
+                                polytopal_mesh.get_tree_ranks());
       cached_tria = std::make_unique<GridTools::Cache<dim>>(
         partitioned_copy.get_triangulation(), mapping);
     }
@@ -906,13 +1139,12 @@ AdaptivePolytopalProblem<dim>::setup_agglomerated_problem()
                                 partitioned_copy.get_polytopes() :
                                 polytopal_mesh.get_polytopes())
     ah->define_agglomerate(polytope);
-  const unsigned int n_q_points = 2 * fe_dg.degree + 1;
+  const unsigned int n_q_points = fe_dg.degree + 1;
   ah->initialize_fe_values(QGauss<dim>(n_q_points),
                            update_values | update_gradients |
                              update_JxW_values | update_quadrature_points,
                            QGauss<dim - 1>(n_q_points));
   ah->distribute_agglomerated_dofs(fe_dg);
-  ratios = PolytopeAdaptivity::shape_ratios(*ah);
 
   if (parameters.problem == "heat")
     {
@@ -952,9 +1184,20 @@ AdaptivePolytopalProblem<dim>::assemble_system(
   const bool   time_step = dt > 0.;
   const double scale     = time_step ? dt : 1.;
 
+  // Without quadrature, the load vector of a polynomial right-hand side
+  // comes from the moments as well.
+  const auto *polynomial_rhs =
+    dynamic_cast<const QuadratureFree::PolynomialFunction<dim> *>(
+      &rhs_function);
+  const bool polynomial_load = integrator && polynomial_rhs;
   std::vector<FullMatrix<double>> stiffness, mass;
+  std::vector<Vector<double>>     load;
   if (integrator)
-    integrator->volume_matrices(*ah, stiffness, time_step ? &mass : nullptr);
+    integrator->volume_matrices(*ah,
+                                stiffness,
+                                time_step ? &mass : nullptr,
+                                polynomial_load ? polynomial_rhs : nullptr,
+                                polynomial_load ? &load : nullptr);
 
   const unsigned int n_dofs = fe_dg.n_dofs_per_cell();
   FullMatrix<double> cell_matrix(n_dofs, n_dofs);
@@ -971,50 +1214,55 @@ AdaptivePolytopalProblem<dim>::assemble_system(
     {
       if (!polytope->is_locally_owned())
         continue;
-      cell_matrix              = 0.;
-      cell_rhs                 = 0.;
-      const auto &agglo_values = ah->reinit(polytope);
-      const auto &points       = agglo_values.get_quadrature_points();
-      rhs_values.resize(points.size());
-      rhs_function.value_list(points, rhs_values);
-
-      // The quadrature points of the polytope come cell by cell, in the
-      // order of get_agglomerate(); the old solution is a polynomial on
-      // every cell.
-      cell_of_point.clear();
-      if (time_step)
+      cell_matrix = 0.;
+      cell_rhs    = 0.;
+      if (polynomial_load)
+        cell_rhs = load[polytope->index()];
+      else
         {
-          const auto        &cells    = polytope->get_agglomerate();
-          const unsigned int per_cell = points.size() / cells.size();
-          for (const auto &cell : cells)
-            cell_of_point.insert(cell_of_point.end(),
-                                 per_cell,
-                                 cell->active_cell_index());
-        }
+          const auto &agglo_values = ah->reinit(polytope);
+          const auto &points       = agglo_values.get_quadrature_points();
+          rhs_values.resize(points.size());
+          rhs_function.value_list(points, rhs_values);
 
-      for (const unsigned int q : agglo_values.quadrature_point_indices())
-        {
-          const double old_value =
-            time_step ?
-              TimeAdaptivity::CellPolynomial::evaluate<dim>(
-                old_solution_on_system_mesh[cell_of_point[q]], points[q]) :
-              0.;
-          for (unsigned int i = 0; i < n_dofs; ++i)
+          // The quadrature points of the polytope come cell by cell, in the
+          // order of get_agglomerate(); the old solution is a polynomial on
+          // every cell.
+          cell_of_point.clear();
+          if (time_step)
             {
-              if (!integrator)
-                for (unsigned int j = 0; j < n_dofs; ++j)
-                  {
-                    cell_matrix(i, j) += scale * agglo_values.shape_grad(i, q) *
-                                         agglo_values.shape_grad(j, q) *
-                                         agglo_values.JxW(q);
-                    if (time_step)
-                      cell_matrix(i, j) += agglo_values.shape_value(i, q) *
-                                           agglo_values.shape_value(j, q) *
-                                           agglo_values.JxW(q);
-                  }
-              cell_rhs(i) += agglo_values.shape_value(i, q) *
-                             (scale * rhs_values[q] + old_value) *
-                             agglo_values.JxW(q);
+              const auto        &cells    = polytope->get_agglomerate();
+              const unsigned int per_cell = points.size() / cells.size();
+              for (const auto &cell : cells)
+                cell_of_point.insert(cell_of_point.end(),
+                                     per_cell,
+                                     cell->active_cell_index());
+            }
+
+          for (const unsigned int q : agglo_values.quadrature_point_indices())
+            {
+              const double old_value =
+                time_step ?
+                  TimeAdaptivity::CellPolynomial::evaluate<dim>(
+                    old_solution_on_system_mesh[cell_of_point[q]], points[q]) :
+                  0.;
+              for (unsigned int i = 0; i < n_dofs; ++i)
+                {
+                  if (!integrator)
+                    for (unsigned int j = 0; j < n_dofs; ++j)
+                      {
+                        cell_matrix(i, j) +=
+                          scale * agglo_values.shape_grad(i, q) *
+                          agglo_values.shape_grad(j, q) * agglo_values.JxW(q);
+                        if (time_step)
+                          cell_matrix(i, j) += agglo_values.shape_value(i, q) *
+                                               agglo_values.shape_value(j, q) *
+                                               agglo_values.JxW(q);
+                      }
+                  cell_rhs(i) += agglo_values.shape_value(i, q) *
+                                 (scale * rhs_values[q] + old_value) *
+                                 agglo_values.JxW(q);
+                }
             }
         }
       if (integrator)
@@ -1025,9 +1273,6 @@ AdaptivePolytopalProblem<dim>::assemble_system(
             cell_matrix.add(1., mass[polytope->index()]);
         }
 
-      const double h = polytope->diameter();
-      const double ratio =
-        PolytopeAdaptivity::shape_ratio(*ah, ratios, polytope);
       polytope->get_dof_indices(local_dof_indices);
 
       for (unsigned int f = 0; f < polytope->n_faces(); ++f)
@@ -1041,9 +1286,8 @@ AdaptivePolytopalProblem<dim>::assemble_system(
                   integrator->face_matrices(
                     *ah, polytope, f, face_mass, face_flux);
                   const double sigma =
-                    PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                              h,
-                                                              ratio);
+                    PolytopeAdaptivity::boundary_penalty<dim>(
+                      penalty_constant, polytope->get_bounding_box());
                   for (unsigned int i = 0; i < n_dofs; ++i)
                     for (unsigned int j = 0; j < n_dofs; ++j)
                       cell_matrix(i, j) +=
@@ -1053,10 +1297,8 @@ AdaptivePolytopalProblem<dim>::assemble_system(
                 }
               const auto  &fe_face = ah->reinit(polytope, f);
               const auto  &normals = fe_face.get_normal_vectors();
-              const double sigma =
-                PolytopeAdaptivity::boundary_penalty<dim>(penalty_constant,
-                                                          h,
-                                                          ratio);
+              const double sigma   = PolytopeAdaptivity::boundary_penalty<dim>(
+                penalty_constant, polytope->get_bounding_box());
               for (const unsigned int q : fe_face.quadrature_point_indices())
                 for (unsigned int i = 0; i < n_dofs; ++i)
                   for (unsigned int j = 0; j < n_dofs; ++j)
@@ -1078,23 +1320,10 @@ AdaptivePolytopalProblem<dim>::assemble_system(
           const unsigned int neighbor_face =
             polytope->neighbor_of_agglomerated_neighbor(f);
           neighbor->get_dof_indices(neighbor_dof_indices);
-          // diameter() is not available for a polytope of another rank, its
-          // bounding-box diagonal is.
-          double h_neighbor;
-          if (neighbor->is_locally_owned())
-            h_neighbor = neighbor->diameter();
-          else
-            {
-              const auto corners =
-                neighbor->get_bounding_box().get_boundary_points();
-              h_neighbor = (corners.second - corners.first).norm();
-            }
           const double sigma = PolytopeAdaptivity::interior_penalty<dim>(
             penalty_constant,
-            h,
-            h_neighbor,
-            ratio,
-            PolytopeAdaptivity::shape_ratio(*ah, ratios, neighbor));
+            polytope->get_bounding_box(),
+            neighbor->get_bounding_box());
           M11 = 0.;
           M12 = 0.;
           M21 = 0.;
@@ -1183,11 +1412,9 @@ template <int dim>
 void
 AdaptivePolytopalProblem<dim>::solve()
 {
-  // deal.II's AMG for an elliptic problem.
-  TrilinosWrappers::PreconditionAMG                 amg;
-  TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-  amg_data.elliptic = true;
-  amg.initialize(system_matrix, amg_data);
+  // Algebraic multigrid with one smoother block per polytope.
+  TrilinosWrappers::PreconditionAMG amg;
+  PolytopeAdaptivity::initialize_polytope_amg(amg, system_matrix, *ah);
   solution.reinit(ah->agglo_dh.locally_owned_dofs(), comm);
   ReductionControl                        solver_control(10000, 1e-13, 1e-7);
   SolverCG<TrilinosWrappers::MPI::Vector> solver(solver_control);
@@ -1226,7 +1453,6 @@ AdaptivePolytopalProblem<dim>::estimate(const Function<dim> &rhs_function,
     locally_relevant_solution,
     rhs_function,
     penalty_constant,
-    ratios,
     indicators_on_system_mesh,
     time_step ? time_derivative : decltype(time_derivative)());
 
@@ -1437,8 +1663,28 @@ template <int dim>
 void
 AdaptivePolytopalProblem<dim>::run_poisson()
 {
-  const SingularSource<dim>   source;
-  const SingularSolution<dim> exact_solution;
+  const bool constant   = parameters.problem == "constant";
+  const bool polynomial = parameters.problem == "polynomial";
+  std::array<unsigned int, dim> zero_exponents;
+  zero_exponents.fill(0);
+  const QuadratureFree::PolynomialFunction<dim> constant_source({zero_exponents},
+                                                                {1.});
+  const QuadratureFree::PolynomialFunction<dim> polynomial_source =
+    polynomial_function<dim>(true);
+  const QuadratureFree::PolynomialFunction<dim> polynomial_solution =
+    polynomial_function<dim>(false);
+  const SingularSolution<dim> singular_solution =
+    parameters.mesh_file.empty() ?
+      SingularSolution<dim>() :
+      SingularSolution<dim>(domain, singular_point);
+  const SingularSource<dim> singular_source(singular_solution);
+  const Function<dim>        &source =
+    constant   ? static_cast<const Function<dim> &>(constant_source) :
+    polynomial ? static_cast<const Function<dim> &>(polynomial_source) :
+                 static_cast<const Function<dim> &>(singular_source);
+  const Function<dim> &exact_solution =
+    polynomial ? static_cast<const Function<dim> &>(polynomial_solution) :
+                 static_cast<const Function<dim> &>(singular_solution);
   pcout << "cycle  polytopes      dofs   estimator       L2 error        "
            "time [s]"
         << std::endl;
@@ -1449,13 +1695,17 @@ AdaptivePolytopalProblem<dim>::run_poisson()
       assemble_system(source, 0.);
       solve();
       // The error before the estimate, which initializes the handler's
-      // FEValues with more quadrature points.
-      const double l2_error = compute_l2_error(exact_solution);
+      // FEValues with more quadrature points. f = 1 has no exact solution.
+      std::ostringstream l2_error;
+      if (constant)
+        l2_error << "-";
+      else
+        l2_error << compute_l2_error(exact_solution);
       estimate(source, 0.);
       pcout << std::setw(5) << cycle << std::setw(11)
             << polytopal_mesh.n_global_polytopes() << std::setw(10)
             << ah->n_dofs() << "   " << std::left << std::setw(16)
-            << error_estimator << std::setw(16) << l2_error << std::right
+            << error_estimator << std::setw(16) << l2_error.str() << std::right
             << Utilities::MPI::max(timer.wall_time(), comm) << std::endl;
       // Uncomment to write the solution and the polytopes for ParaView,
       // outside the timing.
@@ -1579,6 +1829,14 @@ main(int argc, char *argv[])
     (argc > 1) ? argv[1] : "adaptive_polytopal.prm";
   ProblemParameters parameters;
   ParameterAcceptor::initialize(parameter_file, "used_parameters.prm");
-  AdaptivePolytopalProblem<2> problem(parameters, MPI_COMM_WORLD);
-  problem.run();
+  if (parameters.dimension == 2)
+    {
+      AdaptivePolytopalProblem<2> problem(parameters, MPI_COMM_WORLD);
+      problem.run();
+    }
+  else
+    {
+      AdaptivePolytopalProblem<3> problem(parameters, MPI_COMM_WORLD);
+      problem.run();
+    }
 }

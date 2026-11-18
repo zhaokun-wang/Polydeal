@@ -56,19 +56,21 @@ namespace dealii::PolytopeRepartition
    * is partitioned by ParMETIS on the graph of the polytopes, with one vertex
    * per polytope and an edge between polytopes that share a face, under two
    * constraints, degrees of freedom and cells. The global polytope index of a
-   * polytope is its position in the list of the polytopes of all ranks, taken
-   * rank by rank. It is also the index of its vertex in the graph. Every
-   * polytope lies on one rank of the copy, and the polytopes are the same as
-   * on the p4est triangulation.
+   * polytope is the index of its vertex in the graph. By default it is the
+   * position of the polytope in the list of the polytopes of all ranks, taken
+   * rank by rank. Every polytope lies on one rank of the copy, and the
+   * polytopes are the same as on the p4est triangulation. A polytope may also
+   * hold cells of several ranks of the p4est triangulation, as with
+   * PolytopeAdaptivity::InitialPartition::metis: its pieces on these ranks
+   * are joined on the copy.
    *
-   * Per-cell data move between the two triangulations polytope by polytope,
-   * in an order both sides know, so that no CellId is sent. The error
-   * indicators and, for time-dependent problems, the solution go back to the
-   * p4est triangulation, because everything that lasts from one cycle to the
-   * next lives there: the R-tree, which every rank builds once over the
-   * initial cells it owns, the refinement and coarsening, and the transfer of
-   * data to the next mesh. A parallel::fullydistributed::Triangulation can
-   * not be refined, so the copy is built anew in every cycle.
+   * Per-cell data move between the two triangulations piece by piece, in an
+   * order both sides know, so that no CellId is sent. The error indicators
+   * and, for time-dependent problems, the solution go back to the p4est
+   * triangulation, because the refinement and coarsening and the transfer of
+   * data to the next mesh happen there. A
+   * parallel::fullydistributed::Triangulation can not be refined, so the copy
+   * is built anew in every cycle.
    */
   template <int dim>
   class PartitionedCopy
@@ -93,6 +95,33 @@ namespace dealii::PolytopeRepartition
     void
     reinit(const std::vector<std::vector<CellIterator>> &polytopes,
            const unsigned int                            dofs_per_polytope);
+
+    /**
+     * Build the copy for polytopes that may hold cells of several ranks of
+     * the p4est triangulation, as PolytopeAdaptivity::AdaptivePolytopalMesh
+     * gives them with PolytopeAdaptivity::InitialPartition::metis. @p pieces
+     * are the parts of the polytopes on this rank, each a list of locally
+     * owned cells, and @p polytope_indices their global polytope indices;
+     * several pieces, on one rank or on several, may have the same index.
+     * Rank r holds the vertices of the polytopes with the indices from
+     * @p polytope_index_offsets[r] to @p polytope_index_offsets[r+1] - 1 in
+     * the graph that ParMETIS partitions. On the copy, the pieces of a
+     * polytope are joined into one polytope, in the order of the ranks they
+     * come from.
+     *
+     * If @p copy_ranks is not empty, it gives the rank on the copy of every
+     * piece, the same for all pieces of a polytope, and ParMETIS is not
+     * called. With the tree ranks of
+     * PolytopeAdaptivity::AdaptivePolytopalMesh::get_tree_ranks(), the copy
+     * keeps the partition of the initial cells, which tells what the
+     * partition by ParMETIS gains.
+     */
+    void
+    reinit(const std::vector<std::vector<CellIterator>> &pieces,
+           const std::vector<types::global_cell_index>  &polytope_indices,
+           const std::vector<types::global_cell_index>  &polytope_index_offsets,
+           const unsigned int                            dofs_per_polytope,
+           const std::vector<unsigned int>              &copy_ranks = {});
 
     /**
      * The copy.
@@ -139,6 +168,17 @@ namespace dealii::PolytopeRepartition
 
   private:
     /**
+     * The rank on the copy of every polytope, by global polytope index, from
+     * ParMETIS on the graph of the polytopes, for the arguments of reinit().
+     */
+    std::vector<unsigned int>
+    partition_by_parmetis(
+      const std::vector<std::vector<CellIterator>> &pieces,
+      const std::vector<types::global_cell_index>  &polytope_indices,
+      const std::vector<types::global_cell_index>  &polytope_index_offsets,
+      const unsigned int                            dofs_per_polytope) const;
+
+    /**
      * Send per-cell data from the polytopes of one triangulation to the same
      * polytopes on the other. Polytope @p k of @p from_polytopes goes to the
      * rank @p destination[k], and polytope @p k of @p to_polytopes comes from
@@ -183,23 +223,24 @@ namespace dealii::PolytopeRepartition
     std::vector<std::vector<CellIterator>> copy_polytopes;
 
     /**
-     * For every polytope of copy_polytopes, the rank that owns it on the
-     * p4est triangulation.
+     * The pieces of the polytopes of copy_polytopes, as they came from the
+     * ranks of the p4est triangulation, and for each that rank. A polytope
+     * that lies on one rank of the p4est triangulation is one piece.
      */
-    std::vector<unsigned int> p4est_rank_of_copy_polytope;
+    std::vector<std::vector<CellIterator>> copy_pieces;
+    std::vector<unsigned int>              p4est_rank_of_copy_piece;
 
     /**
-     * The polytopes this rank owns on the p4est triangulation, as given to
-     * reinit(). They stay valid until the p4est triangulation is refined, and
-     * reinit() is called again before the next transfer anyway.
+     * The pieces of polytopes this rank owns on the p4est triangulation, as
+     * given to reinit(). They stay valid until the p4est triangulation is
+     * refined, and reinit() is called again before the next transfer anyway.
      */
-    std::vector<std::vector<CellIterator>> p4est_polytopes;
+    std::vector<std::vector<CellIterator>> p4est_pieces;
 
     /**
-     * For every polytope of p4est_polytopes, the rank that holds it on the
-     * copy.
+     * For every piece of p4est_pieces, the rank that holds it on the copy.
      */
-    std::vector<unsigned int> copy_rank_of_p4est_polytope;
+    std::vector<unsigned int> copy_rank_of_p4est_piece;
 
     /**
      * Largest over mean number of degrees of freedom per rank on the copy.
@@ -226,24 +267,204 @@ namespace dealii::PolytopeRepartition
     const std::vector<std::vector<CellIterator>> &polytopes,
     const unsigned int                            dofs_per_polytope)
   {
+    // Every polytope is one piece, and the polytopes of rank r have the
+    // global polytope indices from the number of polytopes on the ranks
+    // before r on, in the order given.
+    std::vector<types::global_cell_index> polytope_index_offsets{0};
+    for (const auto count :
+         Utilities::MPI::all_gather(comm,
+                                    types::global_cell_index(polytopes.size())))
+      polytope_index_offsets.push_back(polytope_index_offsets.back() + count);
+    const types::global_cell_index first_polytope =
+      polytope_index_offsets[Utilities::MPI::this_mpi_process(comm)];
+    std::vector<types::global_cell_index> polytope_indices(polytopes.size());
+    for (std::size_t polytope = 0; polytope < polytopes.size(); ++polytope)
+      polytope_indices[polytope] = first_polytope + polytope;
+    reinit(polytopes,
+           polytope_indices,
+           polytope_index_offsets,
+           dofs_per_polytope);
+  }
+
+
+
+  template <int dim>
+  void
+  PartitionedCopy<dim>::reinit(
+    const std::vector<std::vector<CellIterator>> &pieces,
+    const std::vector<types::global_cell_index>  &polytope_indices,
+    const std::vector<types::global_cell_index>  &polytope_index_offsets,
+    const unsigned int                            dofs_per_polytope,
+    const std::vector<unsigned int>              &copy_ranks)
+  {
+    const unsigned int n_ranks = Utilities::MPI::n_mpi_processes(comm);
+    AssertDimension(pieces.size(), polytope_indices.size());
+    AssertDimension(polytope_index_offsets.size(), n_ranks + 1);
+    Assert(copy_ranks.empty() || copy_ranks.size() == pieces.size(),
+           ExcDimensionMismatch(copy_ranks.size(), pieces.size()));
+
+    // The rank on the copy of every polytope, by global polytope index.
+    const types::global_cell_index n_polytopes =
+      polytope_index_offsets[n_ranks];
+    std::vector<unsigned int> rank_of_polytope;
+    if (copy_ranks.empty())
+      rank_of_polytope = partition_by_parmetis(pieces,
+                                               polytope_indices,
+                                               polytope_index_offsets,
+                                               dofs_per_polytope);
+    else
+      {
+        // Every polytope has at least one piece, and all its pieces have the
+        // same rank on the copy.
+        rank_of_polytope.assign(n_polytopes, 0);
+        for (std::size_t piece = 0; piece < pieces.size(); ++piece)
+          rank_of_polytope[polytope_indices[piece]] = copy_ranks[piece];
+        Utilities::MPI::max(ArrayView<const unsigned int>(rank_of_polytope),
+                            comm,
+                            make_array_view(rank_of_polytope));
+      }
+    std::vector<std::uint64_t> polytopes_per_rank(n_ranks, 0);
+    for (const unsigned int rank : rank_of_polytope)
+      ++polytopes_per_rank[rank];
+    AssertThrow(*std::min_element(polytopes_per_rank.begin(),
+                                  polytopes_per_rank.end()) > 0,
+                ExcMessage("A rank owns no polytope on the copy."));
+
+    // Every polytope has the same number of degrees of freedom, so the
+    // largest over mean number of degrees of freedom per rank of the copy is
+    // that of polytopes.
+    imbalance = double(*std::max_element(polytopes_per_rank.begin(),
+                                         polytopes_per_rank.end())) /
+                (double(n_polytopes) / n_ranks);
+
+    // The rank on the copy of every local piece, and of every cell in
+    // copy_partition, a vector over the global active cells of the p4est
+    // triangulation, the form create_description_from_triangulation() takes.
+    p4est_pieces = pieces;
+    copy_rank_of_p4est_piece.resize(pieces.size());
+    const auto partitioner =
+      p4est_tria.global_active_cell_index_partitioner().lock();
+    LinearAlgebra::distributed::Vector<double> copy_partition(partitioner);
+    for (std::size_t piece = 0; piece < pieces.size(); ++piece)
+      {
+        const auto rank = rank_of_polytope[polytope_indices[piece]];
+        copy_rank_of_p4est_piece[piece] = rank;
+        for (const auto &cell : pieces[piece])
+          copy_partition[cell->global_active_cell_index()] = rank;
+      }
+
+    // Build the copy: every cell goes to the rank of its polytope. The
+    // description lists the coarse cells in the order in which the messages
+    // of the other ranks arrived, and the degrees of freedom are numbered in
+    // the order of the cells. The coarse cells are therefore sorted by their
+    // id, so that the numbering, and with it the linear solver, is the same
+    // in every run.
+    auto description = TriangulationDescription::Utilities::
+      create_description_from_triangulation(p4est_tria, copy_partition);
+    {
+      std::vector<unsigned int> order(description.coarse_cells.size());
+      for (unsigned int i = 0; i < order.size(); ++i)
+        order[i] = i;
+      std::sort(order.begin(), order.end(), [&](const auto a, const auto b) {
+        return description.coarse_cell_index_to_coarse_cell_id[a] <
+               description.coarse_cell_index_to_coarse_cell_id[b];
+      });
+      auto coarse_cells = description.coarse_cells;
+      auto coarse_ids   = description.coarse_cell_index_to_coarse_cell_id;
+      for (unsigned int i = 0; i < order.size(); ++i)
+        {
+          description.coarse_cells[i] = coarse_cells[order[i]];
+          description.coarse_cell_index_to_coarse_cell_id[i] =
+            coarse_ids[order[i]];
+        }
+    }
+    copy_tria.clear();
+    copy_tria.create_triangulation(description);
+
+    // Every piece, sent to the rank that holds its polytope on the copy: its
+    // global polytope index, its number of cells and the CellIds of its
+    // cells in binary form, four words each, in the order of the cells in
+    // the piece.
+    std::map<unsigned int, std::vector<std::uint64_t>> cells_to_send;
+    for (std::size_t piece = 0; piece < pieces.size(); ++piece)
+      {
+        auto &message = cells_to_send[copy_rank_of_p4est_piece[piece]];
+        message.push_back(polytope_indices[piece]);
+        message.push_back(pieces[piece].size());
+        for (const auto &cell : pieces[piece])
+          for (const unsigned int word : cell->id().template to_binary<dim>())
+            message.push_back(word);
+      }
+
+    // The pieces on the copy, in the order of the ranks they come from and,
+    // from each rank, in the order it sent them, which both sides use to
+    // transfer data. The polytopes of the copy join the pieces with the same
+    // global polytope index and are in the order of that index. A polytope
+    // of one piece keeps the order of its cells on the p4est triangulation.
+    copy_pieces.clear();
+    p4est_rank_of_copy_piece.clear();
+    std::map<std::uint64_t, std::vector<CellIterator>> cells_of_polytope;
+    for (const auto &[p4est_rank, message] :
+         Utilities::MPI::some_to_some(comm, cells_to_send))
+      for (std::size_t position = 0; position < message.size();)
+        {
+          const std::uint64_t polytope = message[position];
+          const std::size_t   n_cells  = message[position + 1];
+          position += 2;
+          std::vector<CellIterator> cells;
+          for (std::size_t cell = 0; cell < n_cells; ++cell, position += 4)
+            {
+              std::array<unsigned int, 4> cell_id;
+              for (unsigned int word = 0; word < 4; ++word)
+                cell_id[word] =
+                  static_cast<unsigned int>(message[position + word]);
+              cells.emplace_back(
+                copy_tria.create_cell_iterator(CellId(cell_id)));
+              Assert(cells.back()->is_locally_owned(), ExcInternalError());
+            }
+          auto &joined = cells_of_polytope[polytope];
+          joined.insert(joined.end(), cells.begin(), cells.end());
+          copy_pieces.push_back(std::move(cells));
+          p4est_rank_of_copy_piece.push_back(p4est_rank);
+        }
+    copy_polytopes.clear();
+    for (auto &[polytope, cells] : cells_of_polytope)
+      copy_polytopes.push_back(std::move(cells));
+  }
+
+
+
+  template <int dim>
+  std::vector<unsigned int>
+  PartitionedCopy<dim>::partition_by_parmetis(
+    const std::vector<std::vector<CellIterator>> &pieces,
+    const std::vector<types::global_cell_index>  &polytope_indices,
+    const std::vector<types::global_cell_index>  &polytope_index_offsets,
+    const unsigned int                            dofs_per_polytope) const
+  {
     const unsigned int n_ranks = Utilities::MPI::n_mpi_processes(comm);
     const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
 
     // ParMETIS holds the graph distributed in contiguous blocks of vertices:
     // rank r holds the vertices from vertex_distribution[r] to
-    // vertex_distribution[r + 1] - 1. Every rank holds the vertices of its own
-    // polytopes, so the global polytope index of the first polytope of rank r
-    // is vertex_distribution[r]. ParMETIS needs at least one vertex on every
+    // vertex_distribution[r + 1] - 1, the vertex of a polytope being its
+    // global polytope index. ParMETIS needs at least one vertex on every
     // rank.
-    const std::uint64_t n_local_polytopes = polytopes.size();
+    std::vector<idx_t>  vertex_distribution(polytope_index_offsets.begin(),
+                                           polytope_index_offsets.end());
+    const std::uint64_t first_polytope = vertex_distribution[my_rank];
+    const std::uint64_t n_local_polytopes =
+      vertex_distribution[my_rank + 1] - first_polytope;
+    const std::uint64_t n_vertices = vertex_distribution[n_ranks];
     AssertThrow(Utilities::MPI::min(n_local_polytopes, comm) > 0,
                 ExcMessage("A rank owns no polytope."));
-    std::vector<idx_t> vertex_distribution{0};
-    for (const std::uint64_t count :
-         Utilities::MPI::all_gather(comm, n_local_polytopes))
-      vertex_distribution.push_back(vertex_distribution.back() + idx_t(count));
-    const std::uint64_t first_polytope = vertex_distribution[my_rank];
-    const std::uint64_t n_vertices     = vertex_distribution[n_ranks];
+    const auto rank_of_index = [&](const std::uint64_t index) {
+      return static_cast<unsigned int>(
+        std::upper_bound(polytope_index_offsets.begin(),
+                         polytope_index_offsets.end(),
+                         index) -
+        polytope_index_offsets.begin() - 1);
+    };
 
     // The vertex of the polytope of every cell, in a vector over the global
     // active cells of the p4est triangulation, so that the ghost cells know
@@ -251,38 +472,66 @@ namespace dealii::PolytopeRepartition
     const auto partitioner =
       p4est_tria.global_active_cell_index_partitioner().lock();
     LinearAlgebra::distributed::Vector<double> polytope_of_cell(partitioner);
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
-      for (const auto &cell : polytopes[polytope])
+    for (std::size_t piece = 0; piece < pieces.size(); ++piece)
+      for (const auto &cell : pieces[piece])
         polytope_of_cell[cell->global_active_cell_index()] =
-          double(first_polytope + polytope);
+          double(polytope_indices[piece]);
     polytope_of_cell.update_ghost_values();
 
-    // The neighbours of every local polytope: the polytopes of the cells
-    // across its faces. Across a hanging face the neighbours are the children
-    // of the neighbouring cell on that face.
-    std::vector<std::set<std::uint64_t>> neighbors(n_local_polytopes);
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
-      for (const auto &cell : polytopes[polytope])
+    // The neighbours of every piece: the polytopes of the cells across its
+    // faces. Across a hanging face the neighbours are the children of the
+    // neighbouring cell on that face. Every piece sends its number of cells
+    // and its neighbours to the rank that holds the vertex of its polytope:
+    // the global polytope index, the number of cells, the number of
+    // neighbours and the neighbours.
+    std::map<unsigned int, std::vector<std::uint64_t>> pieces_to_send;
+    for (std::size_t piece = 0; piece < pieces.size(); ++piece)
+      {
+        const std::uint64_t     this_polytope = polytope_indices[piece];
+        std::set<std::uint64_t> neighbors;
+        for (const auto &cell : pieces[piece])
+          {
+            const auto add_neighbor = [&](const auto &neighbor_cell) {
+              const std::uint64_t neighbor_polytope = std::uint64_t(
+                polytope_of_cell[neighbor_cell->global_active_cell_index()]);
+              if (neighbor_polytope != this_polytope)
+                neighbors.insert(neighbor_polytope);
+            };
+            for (const unsigned int f : cell->face_indices())
+              {
+                if (cell->at_boundary(f))
+                  continue;
+                if (cell->neighbor(f)->is_active())
+                  add_neighbor(cell->neighbor(f));
+                else
+                  for (unsigned int subface = 0;
+                       subface < cell->face(f)->n_children();
+                       ++subface)
+                    add_neighbor(cell->neighbor_child_on_subface(f, subface));
+              }
+          }
+        auto &message = pieces_to_send[rank_of_index(this_polytope)];
+        message.push_back(this_polytope);
+        message.push_back(pieces[piece].size());
+        message.push_back(neighbors.size());
+        message.insert(message.end(), neighbors.begin(), neighbors.end());
+      }
+
+    // The number of cells and the neighbours of every local vertex, from
+    // all its pieces.
+    std::vector<std::uint64_t>           n_cells(n_local_polytopes, 0);
+    std::vector<std::set<std::uint64_t>> vertex_neighbors(n_local_polytopes);
+    for (const auto &[rank, message] :
+         Utilities::MPI::some_to_some(comm, pieces_to_send))
+      for (std::size_t position = 0; position < message.size();)
         {
-          const std::uint64_t this_polytope = first_polytope + polytope;
-          const auto          add_neighbor  = [&](const auto &neighbor_cell) {
-            const std::uint64_t neighbor_polytope = std::uint64_t(
-              polytope_of_cell[neighbor_cell->global_active_cell_index()]);
-            if (neighbor_polytope != this_polytope)
-              neighbors[polytope].insert(neighbor_polytope);
-          };
-          for (const unsigned int f : cell->face_indices())
-            {
-              if (cell->at_boundary(f))
-                continue;
-              if (cell->neighbor(f)->is_active())
-                add_neighbor(cell->neighbor(f));
-              else
-                for (unsigned int subface = 0;
-                     subface < cell->face(f)->n_children();
-                     ++subface)
-                  add_neighbor(cell->neighbor_child_on_subface(f, subface));
-            }
+          const std::uint64_t vertex = message[position] - first_polytope;
+          n_cells[vertex] += message[position + 1];
+          const std::size_t n_neighbors = message[position + 2];
+          vertex_neighbors[vertex].insert(message.begin() + position + 3,
+                                          message.begin() + position + 3 +
+                                            n_neighbors);
+          position += 3 + n_neighbors;
         }
 
     // The graph in the compressed format of ParMETIS: the neighbours of
@@ -290,19 +539,19 @@ namespace dealii::PolytopeRepartition
     // adjacency[adjacency_offsets[v + 1] - 1]. Every edge is seen from both
     // of its polytopes, so the adjacency is symmetric, as ParMETIS requires.
     std::vector<idx_t> adjacency_offsets{0}, adjacency;
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
+    for (std::uint64_t vertex = 0; vertex < n_local_polytopes; ++vertex)
       {
-        for (const std::uint64_t neighbor : neighbors[polytope])
+        for (const std::uint64_t neighbor : vertex_neighbors[vertex])
           adjacency.push_back(idx_t(neighbor));
         adjacency_offsets.push_back(idx_t(adjacency.size()));
       }
 
     // Two weights per vertex, degrees of freedom and cells.
     std::vector<idx_t> vertex_weights(2 * n_local_polytopes);
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
+    for (std::uint64_t vertex = 0; vertex < n_local_polytopes; ++vertex)
       {
-        vertex_weights[2 * polytope] = idx_t(std::max(1u, dofs_per_polytope));
-        vertex_weights[2 * polytope + 1] = idx_t(polytopes[polytope].size());
+        vertex_weights[2 * vertex]     = idx_t(std::max(1u, dofs_per_polytope));
+        vertex_weights[2 * vertex + 1] = idx_t(n_cells[vertex]);
       }
 
     // Partition into one part per rank, with weights on the vertices only
@@ -342,9 +591,9 @@ namespace dealii::PolytopeRepartition
 
     // A rank without a polytope is not allowed by AgglomerationHandler. If
     // ParMETIS fails or leaves one, split the vertices into contiguous blocks
-    // of equal size. The vertices are in the order of the cells of the p4est
-    // triangulation, so every block is a connected part of the domain as far
-    // as the space-filling curve of p4est is.
+    // of equal size. The vertices are numbered rank by rank, so every block
+    // covers the polytopes of one or two neighbouring ranks, a connected
+    // part of the domain as far as the partition of these ranks is.
     const bool parmetis_succeeded =
       Utilities::MPI::min(parmetis_status == METIS_OK ? 1 : 0, comm) == 1;
     std::vector<std::uint64_t> polytopes_per_rank(n_ranks, 0);
@@ -362,99 +611,8 @@ namespace dealii::PolytopeRepartition
           }
       }
 
-    // Every polytope has the same number of degrees of freedom, so the
-    // largest over mean number of degrees of freedom per rank of the copy is
-    // that of polytopes.
-    imbalance = double(*std::max_element(polytopes_per_rank.begin(),
-                                         polytopes_per_rank.end())) /
-                (double(n_vertices) / n_ranks);
-
-    // The rank on the copy of every local polytope, and of every cell in
-    // copy_partition, a vector over the global active cells of the p4est
-    // triangulation, the form create_description_from_triangulation() takes.
-    p4est_polytopes = polytopes;
-    copy_rank_of_p4est_polytope.resize(n_local_polytopes);
-    LinearAlgebra::distributed::Vector<double> copy_partition(partitioner);
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
-      {
-        const auto rank = rank_of_vertex[first_polytope + polytope];
-        copy_rank_of_p4est_polytope[polytope] = rank;
-        for (const auto &cell : polytopes[polytope])
-          copy_partition[cell->global_active_cell_index()] = rank;
-      }
-
-    // Build the copy: every cell goes to the rank of its polytope. The
-    // description lists the coarse cells in the order in which the messages
-    // of the other ranks arrived, and the degrees of freedom are numbered in
-    // the order of the cells. The coarse cells are therefore sorted by their
-    // id, so that the numbering, and with it the linear solver, is the same
-    // in every run.
-    auto description = TriangulationDescription::Utilities::
-      create_description_from_triangulation(p4est_tria, copy_partition);
-    {
-      std::vector<unsigned int> order(description.coarse_cells.size());
-      for (unsigned int i = 0; i < order.size(); ++i)
-        order[i] = i;
-      std::sort(order.begin(), order.end(), [&](const auto a, const auto b) {
-        return description.coarse_cell_index_to_coarse_cell_id[a] <
-               description.coarse_cell_index_to_coarse_cell_id[b];
-      });
-      auto coarse_cells = description.coarse_cells;
-      auto coarse_ids   = description.coarse_cell_index_to_coarse_cell_id;
-      for (unsigned int i = 0; i < order.size(); ++i)
-        {
-          description.coarse_cells[i] = coarse_cells[order[i]];
-          description.coarse_cell_index_to_coarse_cell_id[i] =
-            coarse_ids[order[i]];
-        }
-    }
-    copy_tria.clear();
-    copy_tria.create_triangulation(description);
-
-    // Every polytope, sent to the rank that holds it on the copy: its global
-    // polytope index, its number of cells and the CellIds of its cells in
-    // binary form, four words each, in the order of the cells in the polytope.
-    std::map<unsigned int, std::vector<std::uint64_t>> polytopes_to_send;
-    for (std::uint64_t polytope = 0; polytope < n_local_polytopes; ++polytope)
-      {
-        const std::uint64_t global_polytope = first_polytope + polytope;
-        auto &message = polytopes_to_send[static_cast<unsigned int>(
-          rank_of_vertex[global_polytope])];
-        message.push_back(global_polytope);
-        message.push_back(polytopes[polytope].size());
-        for (const auto &cell : polytopes[polytope])
-          for (const unsigned int word : cell->id().template to_binary<dim>())
-            message.push_back(word);
-      }
-    const auto polytopes_received =
-      Utilities::MPI::some_to_some(comm, polytopes_to_send);
-
-    // The polytopes of the copy. The messages arrive in the order of the
-    // sending ranks, and every message lists its polytopes in the order of
-    // their global polytope index, so the polytopes of the copy are in that
-    // order too, and their cells in CellId order, as on the p4est
-    // triangulation.
-    copy_polytopes.clear();
-    p4est_rank_of_copy_polytope.clear();
-    for (const auto &[p4est_rank, message] : polytopes_received)
-      for (std::size_t position = 0; position < message.size();)
-        {
-          const std::size_t n_cells = message[position + 1];
-          position += 2;
-          std::vector<CellIterator> cells;
-          for (std::size_t cell = 0; cell < n_cells; ++cell, position += 4)
-            {
-              std::array<unsigned int, 4> cell_id;
-              for (unsigned int word = 0; word < 4; ++word)
-                cell_id[word] =
-                  static_cast<unsigned int>(message[position + word]);
-              cells.emplace_back(
-                copy_tria.create_cell_iterator(CellId(cell_id)));
-              Assert(cells.back()->is_locally_owned(), ExcInternalError());
-            }
-          copy_polytopes.push_back(std::move(cells));
-          p4est_rank_of_copy_polytope.push_back(p4est_rank);
-        }
+    return std::vector<unsigned int>(rank_of_vertex.begin(),
+                                     rank_of_vertex.end());
   }
 
 
@@ -621,11 +779,11 @@ namespace dealii::PolytopeRepartition
     const std::vector<std::vector<double>> &copy_data,
     std::vector<std::vector<double>>       &p4est_data) const
   {
-    send_cell_data(copy_polytopes,
-                   p4est_rank_of_copy_polytope,
+    send_cell_data(copy_pieces,
+                   p4est_rank_of_copy_piece,
                    copy_data,
-                   p4est_polytopes,
-                   copy_rank_of_p4est_polytope,
+                   p4est_pieces,
+                   copy_rank_of_p4est_piece,
                    p4est_data);
   }
 
@@ -637,11 +795,11 @@ namespace dealii::PolytopeRepartition
     const std::vector<std::vector<double>> &p4est_data,
     std::vector<std::vector<double>>       &copy_data) const
   {
-    send_cell_data(p4est_polytopes,
-                   copy_rank_of_p4est_polytope,
+    send_cell_data(p4est_pieces,
+                   copy_rank_of_p4est_piece,
                    p4est_data,
-                   copy_polytopes,
-                   p4est_rank_of_copy_polytope,
+                   copy_pieces,
+                   p4est_rank_of_copy_piece,
                    copy_data);
   }
 } // namespace dealii::PolytopeRepartition
