@@ -1,0 +1,89 @@
+# Listing of Parameters
+# ---------------------
+subsection Adaptive polytopal solver
+  subsection Adaptivity
+    # For the rule 'single': coarsen at or under this fraction of the polytope
+    # tolerance.
+    set Coarsening fraction    = 0.02
+
+    # Which rank builds the R-tree over an initial cell. 'p4est': the rank that
+    # owns it on the p4est mesh. 'metis': the rank METIS assigns it to; on more
+    # than one rank this requires solving on a partitioned copy.
+    set Initial partition      = metis
+
+    # 'multiple': as many levels per adaptation as the error indicator
+    # predicts. 'single': one level.
+    set Level rule             = multiple
+
+    # The largest number of initial cells in a polytope. It bounds the initial
+    # polytopes and every merge.
+    set Max cells per polytope = 256
+
+    # The largest number of adaptive cycles of the Poisson problem.
+    set Number of cycles       = 20
+
+    # The tolerance for the error estimator of the Poisson problem. The loop
+    # stops once the error estimator is at or under it.
+    set Tolerance              = 3e-4
+  end
+
+  subsection Problem
+    set Dimension              = 3
+    # The polynomial degree of the elements.
+    set Degree                 = 3
+
+    # The initial mesh divides the unit square into this many cells per
+    # direction.
+    set Number of subdivisions = 32
+
+    # 'singular': the Poisson problem with a point singularity. 'heat': the
+    # heat equation with a moving peak.
+    set Problem                = polynomial
+  end
+
+  subsection Quadrature-free integration
+    # Assemble the volume and face matrices without quadrature.
+    set Use quadrature-free integration = true
+  end
+
+  subsection Repartition
+    # Partition the copy by ParMETIS on the graph of the polytopes. Otherwise
+    # every polytope goes to the rank whose R-tree holds its initial cells.
+    set Partition the copy by ParMETIS = false
+
+    # Solve on a copy of the mesh on which every polytope lies on one rank.
+    set Solve on a partitioned copy    = true
+  end
+
+  subsection Time stepping
+    # The final time T.
+    set Final time                 = 0.6
+
+    # Adaptations of the mesh of the initial value.
+    set Initial adaptations        = 5
+
+    # The length of the first step. Steps are not halved below 1/1024 of it.
+    set Initial step length        = 0.02
+
+    # The largest number of mesh adaptations in the loop of the first step.
+    set Max first step adaptations = 10
+
+    # Steps are not doubled beyond this length.
+    set Maximal step length        = 0.02
+
+    # The unit square is divided into this many squares per direction, and
+    # each holds a moving peak scaled to it.
+    set Peaks per direction        = 1
+
+    # The tolerance for the error estimator in space, shared by the current
+    # polytopes.
+    set Space tolerance            = 2.5e-3
+
+    # Steps whose error indicator in time is under this fraction of the time
+    # tolerance are doubled.
+    set Time doubling fraction     = 0
+
+    # The tolerance for the error indicator in time.
+    set Time tolerance             = 0.65
+  end
+end
