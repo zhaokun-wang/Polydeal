@@ -39,12 +39,16 @@ message, and configuring `experiments/` stops. Look first for an existing
 installation (`module avail parmetis`; an installation of PETSc configured
 with `--download-parmetis` also contains one) and pass its directory as
 `PARMETIS_DIR`. Otherwise ParMETIS builds in a few minutes in a user
-directory, for instance version 4.0.3:
+directory. For instance for version 4.0.3, from its unpacked source, with
+`PREFIX` the directory to install it in:
 
 ```bash
-make config cc=mpicc prefix=$HOME/sw/parmetis && make -j4 install
-cd metis && make config prefix=$HOME/sw/parmetis && make -j4 install
+PREFIX=<installation directory>
+make config cc=mpicc prefix=$PREFIX && make -j4 install
+cd metis && make config prefix=$PREFIX && make -j4 install
 ```
+
+and then `PARMETIS_DIR=$PREFIX` in `slurm/common.sh`.
 
 ## Build
 
