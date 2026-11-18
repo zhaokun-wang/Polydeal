@@ -8,8 +8,11 @@ EXP=$ROOT/build-experiments
 # Where the runs write their output, one directory per run.
 RUNS=$HOME/polydeal_runs
 # The modules (or environment) that provide MPI, deal.II, Trilinos, p4est and
-# ParMETIS, as used for the build.
+# ParMETIS, and the installation directories of deal.II and ParMETIS (only
+# build.sbatch uses these two).
 # module load ...
+DEAL_II_DIR=${DEAL_II_DIR:-CHANGE_ME}
+PARMETIS_DIR=${PARMETIS_DIR:-CHANGE_ME}
 
 B=$EXP
 PRM=$ROOT/experiments/prm

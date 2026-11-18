@@ -14,7 +14,7 @@ over to other clusters by editing `slurm/common.sh` and the `#SBATCH` lines.
 |---|---|
 | `test_copies/` | Three copies of example programs with extra output (phase timers, per-step statistics). Each states at its top which example it copies and what it adds. |
 | `prm/` | Parameter files of `adaptive_polytopal_timing`. `q1`/`q0`: with or without quadrature-free integration; `p1`/`p0`: the copy of the mesh partitioned by ParMETIS, or kept on the ranks of the R-trees. |
-| `slurm/` | `common.sh` (settings, to be edited) and one job script per experiment. |
+| `slurm/` | `common.sh` (settings, to be edited), `build.sbatch`, and one job script per experiment. |
 | `CMakeLists.txt` | Builds the three test copies. |
 
 The example `examples/polydeal_baseline.cc` (the polyDEAL Poisson example on a
@@ -48,40 +48,53 @@ cd metis && make config prefix=$HOME/sw/parmetis && make -j4 install
 
 ## Build
 
-With the modules of the libraries loaded (here `$DEAL_II_DIR` and
-`$PARMETIS_DIR` stand for the installation directories):
+polyDEAL has to be built from this repository even where another version of it
+is installed: the experiments rely on changes to the library itself (hanging
+nodes in `source/agglomeration_handler.cc`). The libraries it depends on are
+used as installed.
 
-```bash
-git clone -b thesis-experiments https://github.com/zhaokun-wang/Polydeal.git
-cd Polydeal
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DDEAL_II_DIR=$DEAL_II_DIR -DPARMETIS_DIR=$PARMETIS_DIR ..
-make -j4 polydeal adaptive_polytopal polydeal_baseline
-cd ..
-mkdir build-experiments && cd build-experiments
-cmake -DDEAL_II_DIR=$DEAL_II_DIR -DPOLYDEAL_BUILD=$PWD/../build -DPARMETIS_DIR=$PARMETIS_DIR ../experiments
-make -j3
-```
-
-If the login nodes cannot reach GitHub, clone the repository elsewhere and
-copy it over. The `make` line names its targets, so it stops with an error if ParMETIS was
-not found and `adaptive_polytopal` was skipped. Each program is a single large translation unit (about 2.5 GB of memory and a
-few minutes to compile), so keep the number of parallel jobs low on a login
-node. Configuring `experiments/` stops with a message if deal.II lacks one of
-the required features.
-
-## Running
-
-1. Edit the settings at the top of `slurm/common.sh`: the paths, the output
-   directory and the modules.
-2. Replace `CHANGE_ME` in the `#SBATCH --account` and `#SBATCH --qos` lines of
-   the job scripts.
-3. Submit from `experiments/slurm/` (the scripts find `common.sh` there):
+1. Put the repository on the cluster, for instance with
+   `git clone -b thesis-experiments https://github.com/zhaokun-wang/Polydeal.git`;
+   if the login nodes cannot reach GitHub, clone it elsewhere and copy it over.
+2. Edit the settings at the top of `experiments/slurm/common.sh`: the paths,
+   the output directory, the modules, and the installation directories of
+   deal.II and ParMETIS.
+3. Replace `CHANGE_ME` in the `#SBATCH --account` and `#SBATCH --qos` lines of
+   the job scripts in `experiments/slurm/`.
+4. Build on a compute node, submitting from `experiments/slurm/` (the scripts
+   find `common.sh` there):
 
    ```bash
    cd experiments/slurm
-   for f in *.sbatch; do sbatch $f; done
+   sbatch build.sbatch
    ```
+
+   The job ends with `build finished` in `build_<jobid>.log`. It runs, with the
+   paths of `common.sh`:
+
+   ```bash
+   cd $BUILD
+   cmake -DCMAKE_BUILD_TYPE=Release -DDEAL_II_DIR=$DEAL_II_DIR -DPARMETIS_DIR=$PARMETIS_DIR $ROOT
+   make polydeal adaptive_polytopal polydeal_baseline
+   cd $EXP
+   cmake -DCMAKE_BUILD_TYPE=Release -DDEAL_II_DIR=$DEAL_II_DIR -DPOLYDEAL_BUILD=$BUILD -DPARMETIS_DIR=$PARMETIS_DIR $ROOT/experiments
+   make
+   ```
+
+Each program is a single large translation unit of about 2.5 GB of memory at
+its peak, which is why the build runs as a job rather than on a login node.
+The `make` line names its targets, so the build stops with an error if
+ParMETIS was not found and `adaptive_polytopal` was skipped, and configuring
+`experiments/` stops with a message if deal.II lacks one of the required
+features.
+
+## Running
+
+Once the build has finished, submit the experiments from `experiments/slurm/`:
+
+```bash
+for f in ch*.sbatch unstructured.sbatch; do sbatch $f; done
+```
 
 Every run writes `log.txt` in its own directory under the output directory,
 and a finished run leaves a file `DONE` there. A job that is cut by its time

@@ -10,6 +10,11 @@
 # them one or two at a time on a machine with little memory.
 cmake_minimum_required(VERSION 3.13.4)
 find_package(deal.II 9.7.0 REQUIRED HINTS ${DEAL_II_DIR})
+# Release unless asked otherwise: an installation of deal.II with both build
+# types would otherwise select Debug, which is several times slower.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type")
+endif()
 deal_ii_initialize_cached_variables()
 project(polydeal_experiments CXX)
 
