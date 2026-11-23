@@ -41,6 +41,7 @@
 #include <agglomeration_handler.h>
 
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <memory>
 #include <vector>
@@ -697,30 +698,31 @@ namespace dealii::TimeAdaptivity
   struct StepControlParameters
   {
     /**
-     * The initial step length.
+     * The length of the intervals of the initial uniform subdivision of the
+     * time interval.
      */
     double initial_dt = 0.01;
 
     /**
-     * Steps whose error indicator in time is over this tolerance are halved.
-     * Zero switches the control of the step length off.
+     * Steps whose error indicator in time is over this tolerance are
+     * bisected. Zero switches the control of the step length off.
      */
     double time_tolerance = 0.;
 
     /**
      * Steps whose error indicator in time is under this fraction of the time
-     * tolerance are doubled; zero never doubles, as in the experiments of
-     * the paper.
+     * tolerance are merged with the next interval; zero never merges, as in
+     * the experiments of the paper.
      */
     double time_doubling_fraction = 0.;
 
     /**
-     * Steps are not doubled beyond this length.
+     * Steps are not merged beyond this length.
      */
     double max_dt = std::numeric_limits<double>::max();
 
     /**
-     * Steps are not halved below this length.
+     * Steps are not bisected below this length.
      */
     double min_dt = 0.;
 
@@ -766,9 +768,17 @@ namespace dealii::TimeAdaptivity
    * The step and mesh control of Algorithm 1 of Cangiani, Georgoulis and
    * Metcalfe.
    *
-   * The first step is repeated, halving or doubling its length and adapting
-   * the mesh, with the initial value computed again on every new mesh. This
-   * goes on until the error indicator in time is within its tolerance and
+   * The time interval starts as a uniform subdivision into intervals of
+   * length StepControlParameters::initial_dt. A step that is too long is
+   * bisected: its interval becomes two halves, and the second half is the
+   * next step (lines 8-11 and 27-30). A step that is too short is merged
+   * with the next interval (lines 14-16 and 33-35). The other intervals keep
+   * their length, so after a bisection the steps return to the length of
+   * the subdivision.
+   *
+   * The first step is repeated, changing its length and adapting the mesh,
+   * with the initial value computed again on every new mesh. This goes on
+   * until the error indicator in time is within its tolerance and
    * the largest error indicator of a polytope within the polytope
    * tolerance. Then the mesh is coarsened once and the time stepping starts.
    * Every later step is first brought within the time tolerance on the mesh
@@ -808,6 +818,24 @@ namespace dealii::TimeAdaptivity
 
   private:
     /**
+     * Bisect the current step.
+     */
+    void
+    bisect();
+
+    /**
+     * Merge the current step with the next interval.
+     */
+    void
+    merge();
+
+    /**
+     * The length of the interval after the current one.
+     */
+    double
+    next_length() const;
+
+    /**
      * The parameters of the control.
      */
     const StepControlParameters parameters;
@@ -818,14 +846,21 @@ namespace dealii::TimeAdaptivity
     double dt;
 
     /**
+     * The lengths of the intervals that bisections have left after the
+     * current one, nearest first. Beyond them the intervals have the length
+     * of the initial subdivision.
+     */
+    std::deque<double> pending;
+
+    /**
      * Whether the loop of the first step, lines 5-22 of Algorithm 1, is
      * running.
      */
     bool in_first_step;
 
     /**
-     * Whether the current step was halved already: a halved step is not
-     * doubled again.
+     * Whether the current step was bisected already: a bisected step is not
+     * merged again.
      */
     bool halved;
 
@@ -870,14 +905,42 @@ namespace dealii::TimeAdaptivity
 
 
 
+  inline double
+  StepController::next_length() const
+  {
+    return pending.empty() ? parameters.initial_dt : pending.front();
+  }
+
+
+
+  inline void
+  StepController::bisect()
+  {
+    dt *= 0.5;
+    pending.push_front(dt);
+    halved = true;
+  }
+
+
+
+  inline void
+  StepController::merge()
+  {
+    dt += next_length();
+    if (!pending.empty())
+      pending.pop_front();
+  }
+
+
+
   inline StepDecision
   StepController::decide(const double max_indicator,
                          const double polytope_tolerance,
                          const double time_indicator)
   {
-    // Whether the step is to be halved or may be doubled. A step is not
-    // halved below the shortest length, not doubled beyond the longest, and
-    // not doubled after it was halved.
+    // Whether the step is to be bisected or may be merged with the next
+    // interval. A step is not bisected below the shortest length, not merged
+    // beyond the longest, and not merged after it was bisected.
     const bool step_control_on = parameters.time_tolerance > 0.;
     const bool time_over       = step_control_on &&
                            time_indicator > parameters.time_tolerance &&
@@ -885,7 +948,7 @@ namespace dealii::TimeAdaptivity
     const bool time_under = step_control_on &&
                             time_indicator < parameters.time_doubling_fraction *
                                                parameters.time_tolerance &&
-                            !halved && 2. * dt <= parameters.max_dt;
+                            !halved && dt + next_length() <= parameters.max_dt;
 
     if (in_first_step)
       {
@@ -895,12 +958,9 @@ namespace dealii::TimeAdaptivity
           max_indicator > polytope_tolerance &&
           n_first_step_adaptations < parameters.max_first_step_adaptations;
         if (time_over)
-          {
-            dt *= 0.5;
-            halved = true;
-          }
+          bisect();
         else if (time_under)
-          dt *= 2.;
+          merge();
         if (space_over)
           {
             ++n_first_step_adaptations;
@@ -915,22 +975,25 @@ namespace dealii::TimeAdaptivity
 
     if (adapted)
       {
-        // Line 41: solved again on the adapted mesh, accepted.
+        // Line 41: solved again on the adapted mesh, accepted. The next step
+        // is the next interval.
         adapted = false;
         halved  = false;
+        dt      = next_length();
+        if (!pending.empty())
+          pending.pop_front();
         return StepDecision::accept;
       }
     if (time_over)
       {
         // Lines 26-31.
-        dt *= 0.5;
-        halved = true;
+        bisect();
         return StepDecision::solve_again;
       }
     if (time_under)
       {
         // Lines 32-36.
-        dt *= 2.;
+        merge();
         return StepDecision::solve_again;
       }
     // Line 40: adapt the mesh once and solve the step again.

@@ -62,13 +62,14 @@ subsection Adaptive polytopal solver
     # Adaptations of the mesh of the initial value.
     set Initial adaptations        = 5
 
-    # The length of the first step. Steps are not halved below 1/1024 of it.
+    # The length of the intervals of the initial uniform subdivision of the
+    # time interval. Steps are not bisected below 1/1024 of it.
     set Initial step length        = 0.02
 
     # The largest number of mesh adaptations in the loop of the first step.
     set Max first step adaptations = 10
 
-    # Steps are not doubled beyond this length.
+    # Steps are not merged beyond this length.
     set Maximal step length        = 0.02
 
     # The unit square is divided into this many squares per direction, and
@@ -80,7 +81,7 @@ subsection Adaptive polytopal solver
     set Space tolerance            = 2.5e-3
 
     # Steps whose error indicator in time is under this fraction of the time
-    # tolerance are doubled.
+    # tolerance are merged with the next interval.
     set Time doubling fraction     = 0
 
     # The tolerance for the error indicator in time.

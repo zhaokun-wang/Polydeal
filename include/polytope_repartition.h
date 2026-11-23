@@ -18,6 +18,7 @@
 #include <deal.II/base/config.h>
 
 #include <deal.II/base/mpi.h>
+#include <deal.II/base/utilities.h>
 
 #include <deal.II/distributed/fully_distributed_tria.h>
 #include <deal.II/distributed/tria.h>
@@ -28,6 +29,8 @@
 #include <deal.II/lac/la_parallel_vector.h>
 #include <deal.II/lac/vector.h>
 
+#include <boost/serialization/utility.hpp>
+
 #include <parmetis.h>
 
 #include <algorithm>
@@ -35,11 +38,46 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 
 namespace dealii::PolytopeRepartition
 {
+  namespace internal
+  {
+    /**
+     * What one rank of the p4est triangulation sends to one rank of the copy
+     * for the description of the copy: the coarse cells, their ids and their
+     * vertices, numbered as on the p4est triangulation, whose coarse mesh is
+     * the same on every rank, and the cells of every level.
+     */
+    template <int dim>
+    struct DescriptionPart
+    {
+      std::vector<dealii::CellData<dim>>  coarse_cells;
+      std::vector<types::coarse_cell_id>  coarse_cell_ids;
+      std::vector<unsigned int>           vertex_indices;
+      std::vector<Point<dim>>             vertices;
+      std::vector<std::vector<TriangulationDescription::CellData<dim>>>
+        cell_infos;
+
+      template <class Archive>
+      void
+      serialize(Archive &ar, const unsigned int /*version*/)
+      {
+        ar &coarse_cells;
+        ar &coarse_cell_ids;
+        ar &vertex_indices;
+        ar &vertices;
+        ar &cell_infos;
+      }
+    };
+  } // namespace internal
+
+
+
   /**
    * A copy of a p4est triangulation as a
    * parallel::fullydistributed::Triangulation, partitioned by polytopes.
@@ -177,6 +215,24 @@ namespace dealii::PolytopeRepartition
       const std::vector<types::global_cell_index>  &polytope_indices,
       const std::vector<types::global_cell_index>  &polytope_index_offsets,
       const unsigned int                            dofs_per_polytope) const;
+
+    /**
+     * The description of the copy on this rank, for the rank on the copy of
+     * every locally owned cell in @p copy_partition. It is the description
+     * that
+     * TriangulationDescription::Utilities::create_description_from_triangulation()
+     * gives, with the coarse cells sorted by their id. A rank of the copy
+     * gets its cells, every active cell that shares a vertex with one of
+     * them, and the parents of all these. Each rank of the p4est
+     * triangulation sends these cells for its locally owned cells, which it
+     * finds among its locally owned and ghost cells. The deal.II function
+     * instead loops, for every rank it sends to, over all cells and vertices
+     * of every level, the coarse cells of the whole mesh included, so it
+     * becomes slower as the number of ranks grows.
+     */
+    TriangulationDescription::Description<dim>
+    create_description(
+      const LinearAlgebra::distributed::Vector<double> &copy_partition) const;
 
     /**
      * Send per-cell data from the polytopes of one triangulation to the same
@@ -353,33 +409,9 @@ namespace dealii::PolytopeRepartition
           copy_partition[cell->global_active_cell_index()] = rank;
       }
 
-    // Build the copy: every cell goes to the rank of its polytope. The
-    // description lists the coarse cells in the order in which the messages
-    // of the other ranks arrived, and the degrees of freedom are numbered in
-    // the order of the cells. The coarse cells are therefore sorted by their
-    // id, so that the numbering, and with it the linear solver, is the same
-    // in every run.
-    auto description = TriangulationDescription::Utilities::
-      create_description_from_triangulation(p4est_tria, copy_partition);
-    {
-      std::vector<unsigned int> order(description.coarse_cells.size());
-      for (unsigned int i = 0; i < order.size(); ++i)
-        order[i] = i;
-      std::sort(order.begin(), order.end(), [&](const auto a, const auto b) {
-        return description.coarse_cell_index_to_coarse_cell_id[a] <
-               description.coarse_cell_index_to_coarse_cell_id[b];
-      });
-      auto coarse_cells = description.coarse_cells;
-      auto coarse_ids   = description.coarse_cell_index_to_coarse_cell_id;
-      for (unsigned int i = 0; i < order.size(); ++i)
-        {
-          description.coarse_cells[i] = coarse_cells[order[i]];
-          description.coarse_cell_index_to_coarse_cell_id[i] =
-            coarse_ids[order[i]];
-        }
-    }
+    // Build the copy: every cell goes to the rank of its polytope.
     copy_tria.clear();
-    copy_tria.create_triangulation(description);
+    copy_tria.create_triangulation(create_description(copy_partition));
 
     // Every piece, sent to the rank that holds its polytope on the copy: its
     // global polytope index, its number of cells and the CellIds of its
@@ -613,6 +645,222 @@ namespace dealii::PolytopeRepartition
 
     return std::vector<unsigned int>(rank_of_vertex.begin(),
                                      rank_of_vertex.end());
+  }
+
+
+
+  template <int dim>
+  TriangulationDescription::Description<dim>
+  PartitionedCopy<dim>::create_description(
+    const LinearAlgebra::distributed::Vector<double> &copy_partition) const
+  {
+    Assert(p4est_tria.get_periodic_face_map().empty(), ExcNotImplemented());
+
+    // The rank on the copy of a locally owned or ghost cell.
+    copy_partition.update_ghost_values();
+    const auto rank_on_copy = [&](const auto &cell) {
+      return static_cast<unsigned int>(
+        copy_partition[cell->global_active_cell_index()]);
+    };
+
+    // A cell of any level as one number, its level and its index on the
+    // level, which sorts faster than an iterator.
+    using AnyCellIterator = typename Triangulation<dim>::cell_iterator;
+    const auto key_of = [](const AnyCellIterator &cell) {
+      return (std::uint64_t(cell->level()) << 32) |
+             std::uint64_t(cell->index());
+    };
+    const auto cell_of = [&](const std::uint64_t key) {
+      return AnyCellIterator(&p4est_tria,
+                             int(key >> 32),
+                             int(key & 0xffffffff));
+    };
+
+    // The locally owned and ghost cells at each of their vertices, sorted by
+    // the index of the vertex, with the rank on the copy of the locally owned
+    // ones. This is the only loop over all active cells, which include the
+    // coarse cells of the whole mesh away from this rank.
+    struct CellAtVertex
+    {
+      unsigned int  vertex;
+      std::uint64_t cell;
+      unsigned int  rank;
+    };
+    std::vector<CellAtVertex> cells_at_vertex;
+    for (const auto &cell : p4est_tria.active_cell_iterators())
+      if (!cell->is_artificial())
+        {
+          const unsigned int rank = cell->is_locally_owned() ?
+                                      rank_on_copy(cell) :
+                                      numbers::invalid_unsigned_int;
+          for (const unsigned int v : cell->vertex_indices())
+            cells_at_vertex.push_back(
+              {cell->vertex_index(v), key_of(cell), rank});
+        }
+    std::sort(cells_at_vertex.begin(),
+              cells_at_vertex.end(),
+              [](const auto &a, const auto &b) { return a.vertex < b.vertex; });
+
+    // The cells every rank of the copy gets from this rank: the locally owned
+    // cells that go to it, the active cells that share a vertex with them,
+    // and the parents of all these, each once. All cells at a vertex go to
+    // the ranks of the locally owned cells at it.
+    std::map<unsigned int, std::vector<std::uint64_t>> cells_for_rank;
+    std::vector<unsigned int>                          ranks_at_vertex;
+    for (auto first = cells_at_vertex.begin(); first != cells_at_vertex.end();)
+      {
+        auto last = first;
+        ranks_at_vertex.clear();
+        for (; last != cells_at_vertex.end() && last->vertex == first->vertex;
+             ++last)
+          if (last->rank != numbers::invalid_unsigned_int &&
+              std::find(ranks_at_vertex.begin(),
+                        ranks_at_vertex.end(),
+                        last->rank) == ranks_at_vertex.end())
+            ranks_at_vertex.push_back(last->rank);
+        for (const unsigned int rank : ranks_at_vertex)
+          {
+            auto &cells = cells_for_rank[rank];
+            for (auto entry = first; entry != last; ++entry)
+              cells.push_back(entry->cell);
+          }
+        first = last;
+      }
+    for (auto &[rank, cells] : cells_for_rank)
+      {
+        std::sort(cells.begin(), cells.end());
+        cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+        std::unordered_set<std::uint64_t> parents;
+        for (const std::uint64_t key : cells)
+          for (auto cell = cell_of(key); cell->level() > 0;)
+            {
+              cell = cell->parent();
+              if (!parents.insert(key_of(cell)).second)
+                break;
+            }
+        cells.insert(cells.end(), parents.begin(), parents.end());
+      }
+
+    // The part of the description for every rank, filled as the deal.II
+    // function does. The active cells get their rank on the copy, and the
+    // parents are artificial. No level of the copy is owned, since the copy
+    // has no multigrid hierarchy.
+    const unsigned int n_levels = p4est_tria.n_global_levels();
+    std::map<unsigned int, internal::DescriptionPart<dim>> parts;
+    for (const auto &[rank, cells] : cells_for_rank)
+      {
+        auto &part = parts[rank];
+        part.cell_infos.resize(n_levels);
+        for (const std::uint64_t key : cells)
+          {
+            const auto cell = cell_of(key);
+            TriangulationDescription::CellData<dim> cell_info;
+            cell_info.id = cell->id().template to_binary<dim>();
+            for (const unsigned int f : cell->face_indices())
+              {
+                const types::boundary_id boundary_id =
+                  cell->face(f)->boundary_id();
+                if (boundary_id != numbers::internal_face_boundary_id)
+                  cell_info.boundary_ids.emplace_back(f, boundary_id);
+              }
+            cell_info.manifold_id = cell->manifold_id();
+            if constexpr (dim >= 2)
+              for (const unsigned int line : cell->line_indices())
+                cell_info.manifold_line_ids[line] =
+                  cell->line(line)->manifold_id();
+            if constexpr (dim == 3)
+              for (const unsigned int f : cell->face_indices())
+                cell_info.manifold_quad_ids[f] = cell->quad(f)->manifold_id();
+            cell_info.subdomain_id =
+              cell->is_active() ? rank_on_copy(cell) :
+                                  numbers::artificial_subdomain_id;
+            cell_info.level_subdomain_id = numbers::artificial_subdomain_id;
+            part.cell_infos[cell->level()].push_back(cell_info);
+
+            if (cell->level() == 0)
+              {
+                dealii::CellData<dim> coarse_cell(cell->n_vertices());
+                coarse_cell.material_id = cell->material_id();
+                coarse_cell.manifold_id = cell->manifold_id();
+                for (const unsigned int v : cell->vertex_indices())
+                  {
+                    coarse_cell.vertices[v] = cell->vertex_index(v);
+                    part.vertex_indices.push_back(cell->vertex_index(v));
+                    part.vertices.push_back(cell->vertex(v));
+                  }
+                part.coarse_cells.push_back(coarse_cell);
+                part.coarse_cell_ids.push_back(cell->id().get_coarse_cell_id());
+              }
+          }
+      }
+
+    // Join the parts from all ranks. A cell may come from several ranks, the
+    // same from each, and is kept once. The coarse cells, the vertices and
+    // the cells of every level are sorted by their ids, which fixes the
+    // numbering of the degrees of freedom on the copy, and with it the linear
+    // solver, in every run.
+    std::vector<std::pair<types::coarse_cell_id, dealii::CellData<dim>>>
+                                                    coarse_cells;
+    std::vector<std::pair<unsigned int, Point<dim>>> vertices;
+    std::vector<std::vector<TriangulationDescription::CellData<dim>>>
+      cell_infos(n_levels);
+    for (const auto &[rank, part] : Utilities::MPI::some_to_some(comm, parts))
+      {
+        for (std::size_t i = 0; i < part.coarse_cells.size(); ++i)
+          coarse_cells.emplace_back(part.coarse_cell_ids[i],
+                                    part.coarse_cells[i]);
+        for (std::size_t i = 0; i < part.vertices.size(); ++i)
+          vertices.emplace_back(part.vertex_indices[i], part.vertices[i]);
+        for (unsigned int level = 0; level < n_levels; ++level)
+          cell_infos[level].insert(cell_infos[level].end(),
+                                   part.cell_infos[level].begin(),
+                                   part.cell_infos[level].end());
+      }
+    const auto by_first = [](const auto &a, const auto &b) {
+      return a.first < b.first;
+    };
+    const auto same_first = [](const auto &a, const auto &b) {
+      return a.first == b.first;
+    };
+    std::sort(coarse_cells.begin(), coarse_cells.end(), by_first);
+    coarse_cells.erase(
+      std::unique(coarse_cells.begin(), coarse_cells.end(), same_first),
+      coarse_cells.end());
+    std::sort(vertices.begin(), vertices.end(), by_first);
+    vertices.erase(std::unique(vertices.begin(), vertices.end(), same_first),
+                   vertices.end());
+
+    TriangulationDescription::Description<dim> description;
+    description.comm      = comm;
+    description.smoothing = p4est_tria.get_mesh_smoothing();
+    for (const auto &[index, vertex] : vertices)
+      description.coarse_cell_vertices.push_back(vertex);
+    for (auto &[id, coarse_cell] : coarse_cells)
+      {
+        for (auto &vertex : coarse_cell.vertices)
+          vertex = std::lower_bound(vertices.begin(),
+                                    vertices.end(),
+                                    vertex,
+                                    [](const auto &a, const unsigned int b) {
+                                      return a.first < b;
+                                    }) -
+                   vertices.begin();
+        description.coarse_cells.push_back(coarse_cell);
+        description.coarse_cell_index_to_coarse_cell_id.push_back(id);
+      }
+    description.cell_infos.resize(n_levels);
+    for (unsigned int level = 0; level < n_levels; ++level)
+      {
+        auto &infos = cell_infos[level];
+        std::sort(infos.begin(), infos.end(), [](const auto &a, const auto &b) {
+          return a.id < b.id;
+        });
+        for (const auto &cell_info : infos)
+          if (description.cell_infos[level].empty() ||
+              description.cell_infos[level].back().id != cell_info.id)
+            description.cell_infos[level].push_back(cell_info);
+      }
+    return description;
   }
 
 

@@ -229,11 +229,12 @@ ProblemParameters::ProblemParameters()
     add_parameter("Final time", final_time, "The final time T.");
     add_parameter("Initial step length",
                   initial_dt,
-                  "The length of the first step. Steps are not halved below "
-                  "1/1024 of it.");
+                  "The length of the intervals of the initial uniform "
+                  "subdivision of the time interval. Steps are not bisected "
+                  "below 1/1024 of it.");
     add_parameter("Maximal step length",
                   max_dt,
-                  "Steps are not doubled beyond this length.");
+                  "Steps are not merged beyond this length.");
     add_parameter("Space tolerance",
                   space_tolerance,
                   "The tolerance for the error estimator in space, shared by "
@@ -244,7 +245,8 @@ ProblemParameters::ProblemParameters()
     add_parameter("Time doubling fraction",
                   time_doubling_fraction,
                   "Steps whose error indicator in time is under this "
-                  "fraction of the time tolerance are doubled.");
+                  "fraction of the time tolerance are merged with the next "
+                  "interval.");
     add_parameter("Initial adaptations",
                   n_initial_adaptations,
                   "Adaptations of the mesh of the initial value.");
